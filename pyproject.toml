@@ -1,0 +1,22 @@
+[project]
+name = "pychem"
+version = "0.1.0"
+description = "Herramienta modular de visualización y análisis molecular"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "pyvista>=0.48.4",
+    "pyvistaqt>=0.11.0",
+    "pyside6>=6.7.0",
+    "rdkit>=2026.3.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
