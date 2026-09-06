@@ -6,7 +6,7 @@ orbitals, electron densities, etc.).
 
 ## Project status
 
-Current phase — **trajectories, part 1 (step 4/14 of the plan)**.
+Current phase —  (step 5/14 of the plan)**.
 
 Done:
 
@@ -27,16 +27,32 @@ Done:
 - **Trajectory playback**: open a multi-frame XYZ, play/pause/stop, frame
   slider, speed, loop, and **linear interpolation** with an **Auto mode**
   (FPS watchdog with hysteresis) or manual On/Off.
+- **Dynamic bonds**: bonds appear/disappear with the distance between frames,
+  using **hysteresis** (break > form thresholds) to avoid flicker; toggleable
+  (off = keep the frame-0 connectivity).
+- **Volumetric data / isosurfaces (step 5, part 1)**: Gaussian **cube** reader
+  (including **multi-block** cubes) and **Molden** reader (s/p basis; orbitals
+  evaluated on a grid on demand). When such a file is opened, the structure is
+  shown as usual and the side panel offers a **"Plot isosurface"** button;
+  plotting shows the field and a list of the orbitals/fields, each selectable
+  with a click. Isosurface settings: **absolute isovalue** (auto-suggested on
+  first plot, editable), **quality** (Low/Medium/High), and the Volumetric
+  section is kept to about half of the panel area.
+- **Measurements**: a side-panel section with three exclusive modes — Bonds,
+  Angles and Dihedrals. Pick 2/3/4 atoms (left-click) and the value appears as
+  an anchored, always-readable label in the 3D viewer near the measured atoms;
+  in Angles/Dihedrals the central atom(s) are highlighted distinctly (magenta)
+  from the involved endpoints (gold rings). Switching modes, clicking the same
+  mode again or loading a new file clears the measurement and the selection.
 - **PySide6 GUI** (`pychem/app/`): open a structure, export a PNG image,
   reset the camera, a fixed side panel with atom properties and trajectory
   controls, status bar.
 - `main.py` with three modes: GUI, *offscreen* render and text summary.
-- Tests with pytest (38 tests).
+- Tests with pytest (46 tests).
 
 In progress / next:
 
-- Dynamic bonds (appear/disappear by distance) with hysteresis.
-- More formats (PDB, Cube, Molden...).
+- More formats (PDB, Cube refinements, Molden with d/f shells...).
 
 ## Layout
 

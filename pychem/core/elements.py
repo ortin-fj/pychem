@@ -75,5 +75,13 @@ def element(symbol: str) -> Element:
     return Element(symbol.capitalize(), *data)
 
 
+_SYMBOL_BY_NUMBER = {v[0]: k for k, v in _ELEMENTS.items()}
+
+
+def symbol_from_number(number: int) -> str:
+    """Return the element symbol for an atomic number ('' if unknown)."""
+    return _SYMBOL_BY_NUMBER.get(number, "")
+
+
 def is_known(symbol: str) -> bool:
     return symbol.capitalize() in _ELEMENTS

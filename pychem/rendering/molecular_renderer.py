@@ -32,6 +32,12 @@ _TUBE_RESOLUTION = 12
 _SELECTION_THETA = 16
 _SELECTION_PHI = 10
 
+# Measurement overlay visuals (Bonds/Angles/Dihedrals).
+_MEAS_RING_COLOR = (0.9, 0.62, 0.0)  # gold wireframe around the involved atoms
+_MEAS_CENTRAL_COLOR = (0.95, 0.12, 0.55)  # translucent fill on central atoms
+_MEAS_CENTRAL_OPACITY = 0.55
+_MEAS_LABEL_FONT_SIZE = 16
+
 # Maximum movement (px) between press and release to be considered a "click"
 # (above this it is a drag to rotate the camera).
 _CLICK_TOLERANCE = 6
@@ -81,6 +87,7 @@ class MolecularRenderer:
         self._bonds: np.ndarray | None = None
         self._selection_actor: object | None = None
         self.selected_index: int | None = None
+        self._meas_actors: list[object] = []
         self._pick_callback = None
         self._empty_callback = None
         self._iren = None
@@ -92,6 +99,7 @@ class MolecularRenderer:
 
     def clear(self) -> None:
         """Remove all actors created by this renderer."""
+        self.clear_measurement()
         for actor in self._actors:
             try:
                 self.plotter.remove_actor(actor)
@@ -109,11 +117,22 @@ class MolecularRenderer:
         self._molecule = None
         self._bonds = None
 
-    def show(self, molecule: Molecule, options: RenderOptions | None = None) -> None:
-        """Clear the scene and show ``molecule``. Resets the camera."""
+    def show(
+        self,
+        molecule: Molecule,
+        options: RenderOptions | None = None,
+        *,
+        bonds: np.ndarray | None = None,
+    ) -> None:
+        """Clear the scene and show ``molecule``. Resets the camera.
+
+        ``bonds`` optionally overrides the connectivity (e.g. computed with
+        hysteresis during trajectory playback); when ``None`` the bonds are
+        guessed from the current geometry.
+        """
         opts = replace(self.options, **{}) if options is None else options
         self.clear()
-        self.add_molecule(molecule, opts)
+        self.add_molecule(molecule, opts, bonds=bonds)
         if self.options.background is not None:
             try:
                 self.plotter.set_background(self.options.background)
@@ -123,7 +142,11 @@ class MolecularRenderer:
     # -- actor construction -------------------------------------------------
 
     def add_molecule(
-        self, molecule: Molecule, options: RenderOptions | None = None
+        self,
+        molecule: Molecule,
+        options: RenderOptions | None = None,
+        *,
+        bonds: np.ndarray | None = None,
     ) -> None:
         opts = options or self.options
         symbols = molecule.symbols
@@ -133,12 +156,12 @@ class MolecularRenderer:
         self._atom_actors = self._add_atoms(symbols, coords, opts)
         self._actors.extend(self._atom_actors)
 
-        self._bonds = None
-        if opts.show_bonds and molecule.n_atoms > 1:
+        self._bonds = bonds
+        if bonds is None and opts.show_bonds and molecule.n_atoms > 1:
             bonds = guess_bonds(molecule)
             self._bonds = bonds
-            if bonds.size:
-                self._actors.append(self._add_bonds(coords, bonds, opts))
+        if bonds is not None and bonds.size:
+            self._actors.append(self._add_bonds(coords, bonds, opts))
 
     def _add_atoms(
         self,
@@ -378,3 +401,110 @@ class MolecularRenderer:
             reset_camera=False,
         )
         self.selected_index = index
+
+    # -- measurement overlays ------------------------------------------------
+
+    def clear_measurement(self) -> None:
+        """Remove the measurement markers/label actors."""
+        for actor in self._meas_actors:
+            try:
+                self.plotter.remove_actor(actor)
+            except Exception:  # pragma: no cover - already removed
+                pass
+        self._meas_actors = []
+
+    def set_measurement(
+        self,
+        indices: list[int],
+        central: tuple[int, ...] = (),
+        label: str | None = None,
+        anchor: np.ndarray | None = None,
+    ) -> None:
+        """Draw markers (and an optional label) for an active measurement.
+
+        ``indices`` are the involved atoms in selection order; ``central``
+        lists the ones highlighted as central (the angle/dihedral pivots). The
+        markers are simple wireframe spheres like the Atom Properties
+        selection halo, but coloured: gold on every involved atom and magenta
+        on the central ones, which additionally get a translucent fill so they
+        stand out. When ``label`` and ``anchor`` are given, the text is drawn
+        in the viewer, anchored to the world point ``anchor`` and always kept
+        readable.
+        """
+        self.clear_measurement()
+        molecule = self._molecule
+        if molecule is None or not indices:
+            return
+        opts = self.options
+        central_set = {int(i) for i in central}
+        for i in indices:
+            i = int(i)
+            if not 0 <= i < molecule.n_atoms:
+                self.clear_measurement()
+                return
+            atom = molecule.get_atom(i)
+            is_central = i in central_set
+            # Same geometry as the Atom Properties selection halo (kept thin
+            # and simple); only the colour differs per role.
+            ring_radius = max(
+                0.25,
+                element(atom.symbol).vdw_radius
+                * opts.atom_scale
+                * opts.selection_scale,
+            )
+            color = _MEAS_CENTRAL_COLOR if is_central else _MEAS_RING_COLOR
+            ring = pv.Sphere(
+                center=atom.position,
+                radius=ring_radius,
+                theta_resolution=_SELECTION_THETA,
+                phi_resolution=_SELECTION_PHI,
+            )
+            self._meas_actors.append(
+                self.plotter.add_mesh(
+                    ring,
+                    style="wireframe",
+                    color=color,
+                    line_width=opts.selection_line_width,
+                    name=f"meas-ring-{i}",
+                    reset_camera=False,
+                )
+            )
+            if is_central:
+                # A subtle translucent fill makes the pivot atoms unmistakable.
+                fill_radius = max(
+                    0.22,
+                    element(atom.symbol).vdw_radius * opts.atom_scale,
+                )
+                core = pv.Sphere(
+                    center=atom.position,
+                    radius=fill_radius,
+                    theta_resolution=_SPHERE_THETA,
+                    phi_resolution=_SPHERE_PHI,
+                )
+                self._meas_actors.append(
+                    self.plotter.add_mesh(
+                        core,
+                        color=_MEAS_CENTRAL_COLOR,
+                        opacity=_MEAS_CENTRAL_OPACITY,
+                        smooth_shading=True,
+                        name=f"meas-central-{i}",
+                        reset_camera=False,
+                    )
+                )
+        if label is not None and anchor is not None:
+            actor = self.plotter.add_point_labels(
+                np.asarray([anchor], dtype=float),
+                [str(label)],
+                font_size=_MEAS_LABEL_FONT_SIZE,
+                bold=True,
+                text_color=(0.08, 0.08, 0.08),
+                shape="rounded_rect",
+                shape_color=(1.0, 0.98, 0.87),
+                fill_shape=True,
+                margin=5,
+                show_points=False,
+                always_visible=True,
+                name="measurement-label",
+                reset_camera=False,
+            )
+            self._meas_actors.append(actor)
