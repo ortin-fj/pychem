@@ -38,6 +38,15 @@ _MEAS_CENTRAL_COLOR = (0.95, 0.12, 0.55)  # translucent fill on central atoms
 _MEAS_CENTRAL_OPACITY = 0.55
 _MEAS_LABEL_FONT_SIZE = 16
 
+# Atom ID labels (Tools > Show ID label): plain text (no background box). The
+# green matches the side-panel titles (#87D68D); atoms whose CPK colour is too
+# light (e.g. white hydrogen) get black text instead, so the number stays
+# readable on top of the sphere.
+_ID_LABEL_FONT_SIZE = 12
+_ID_LABEL_COLOR = (0.53, 0.84, 0.55)  # ~ #87D68D
+_ID_LABEL_BLACK = (0.0, 0.0, 0.0)
+_ID_LABEL_LIGHT_CPK = 190.0  # CPK luminance above which green is unreadable
+
 # Maximum movement (px) between press and release to be considered a "click"
 # (above this it is a drag to rotate the camera).
 _CLICK_TOLERANCE = 6
@@ -88,6 +97,8 @@ class MolecularRenderer:
         self._selection_actor: object | None = None
         self.selected_index: int | None = None
         self._meas_actors: list[object] = []
+        self._id_label_actors: list[object] = []
+        self._show_id_labels = False
         self._pick_callback = None
         self._empty_callback = None
         self._iren = None
@@ -100,6 +111,7 @@ class MolecularRenderer:
     def clear(self) -> None:
         """Remove all actors created by this renderer."""
         self.clear_measurement()
+        self.clear_id_labels()
         for actor in self._actors:
             try:
                 self.plotter.remove_actor(actor)
@@ -163,6 +175,10 @@ class MolecularRenderer:
         if bonds is not None and bonds.size:
             self._actors.append(self._add_bonds(coords, bonds, opts))
 
+        # Rebuild the atom-ID overlay for the new molecule/pose when enabled.
+        if self._show_id_labels:
+            self._refresh_id_labels()
+
     def _add_atoms(
         self,
         symbols: list[str],
@@ -216,6 +232,69 @@ class MolecularRenderer:
             name="bonds",
             reset_camera=False,
         )
+
+    # -- atom ID labels ------------------------------------------------------
+
+    def set_id_labels(self, visible: bool) -> None:
+        """Show/hide the per-atom ID numbers (persists across molecule swaps)."""
+        self._show_id_labels = bool(visible)
+        self._refresh_id_labels()
+
+    def clear_id_labels(self) -> None:
+        """Remove the atom-ID label actors."""
+        for actor in self._id_label_actors:
+            try:
+                self.plotter.remove_actor(actor)
+            except Exception:  # pragma: no cover - already removed
+                pass
+        self._id_label_actors = []
+
+    def _refresh_id_labels(self) -> None:
+        """(Re)draw the atom-ID labels over the current molecule, if enabled.
+
+        Plain numbers (no text box) placed at every atom. The text is green
+        like the side-panel titles except on very light atoms (white
+        hydrogen...) where black guarantees legibility. Two label actors keep
+        the two colours.
+        """
+        self.clear_id_labels()
+        if not self._show_id_labels or self._molecule is None:
+            return
+        green: list[int] = []
+        black: list[int] = []
+        for i, symbol in enumerate(self._molecule.symbols):
+            cpk = element(symbol).color
+            lum = 0.299 * cpk[0] + 0.587 * cpk[1] + 0.114 * cpk[2]
+            (black if lum >= _ID_LABEL_LIGHT_CPK else green).append(i)
+        coords = self._molecule.coords
+        for indices, color, name in (
+            (green, _ID_LABEL_COLOR, "id-labels-green"),
+            (black, _ID_LABEL_BLACK, "id-labels-black"),
+        ):
+            if not indices:
+                continue
+            actor = self.plotter.add_point_labels(
+                np.asarray(coords[indices], dtype=float),
+                [str(i + 1) for i in indices],
+                font_size=_ID_LABEL_FONT_SIZE,
+                bold=True,
+                text_color=color,
+                show_points=False,
+                always_visible=True,
+                # No background shape: only the plain number must be drawn
+                # (pyvista would otherwise add a rounded box behind the text).
+                shape=None,
+                name=name,
+                reset_camera=False,
+            )
+            # Keep the numbers out of the atom picking loop.
+            set_pickable = getattr(actor, "SetPickable", None)
+            if callable(set_pickable):
+                try:
+                    set_pickable(0)
+                except Exception:  # pragma: no cover
+                    pass
+            self._id_label_actors.append(actor)
 
     # -- atom selection -----------------------------------------------------
 

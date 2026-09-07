@@ -39,6 +39,9 @@ class VolumetricFile:
     compute: Callable[[int], VolumeData]  # compute(i) -> VolumeData
     name: str = ""
     metadata: dict[str, object] = field(default_factory=dict)
+    # Present only for Molden files: the parsed (s/p) basis that lets the GUI
+    # also visualize individual atomic orbitals.
+    basis: object | None = None
 
     def volume(self, index: int) -> VolumeData:
         return self.compute(index)
@@ -57,7 +60,15 @@ def _read_numbers(text: str) -> list[float]:
 
 
 def read_cube(path: str | Path) -> tuple[Molecule, list[VolumeData]]:
-    """Read a Gaussian cube file -> (molecule, list of scalar fields)."""
+    """Read a Gaussian cube file -> (molecule, list of scalar fields).
+
+    Gaussian/ORCA cube files store the atom positions, the grid origin and
+    the axis vectors in atomic units (Bohr). They are converted to Ångstrom
+    here so ``Molecule``/``VolumeData`` keep the project-wide Å convention
+    (the Molden reader applies the same conversion to its ``[Atoms] AU``
+    block). The scalar field values themselves are left untouched: they are
+    orbital/density values, not distances.
+    """
     lines = Path(path).read_text(encoding="utf-8").splitlines()
     if len(lines) < 7:
         raise ValueError(f"Invalid cube file (too short): {path}")
@@ -65,14 +76,14 @@ def read_cube(path: str | Path) -> tuple[Molecule, list[VolumeData]]:
     comment2 = lines[1].strip()
     counts = lines[2].split()
     natoms = abs(int(float(counts[0])))
-    origin = np.array([float(v) for v in counts[1:4]])
+    origin = np.array([float(v) for v in counts[1:4]]) * BOHR
 
     dims: list[int] = []
     spacing = np.zeros(3)
     for i, line in enumerate(lines[3:6]):
         parts = line.split()
         dims.append(int(float(parts[0])))
-        spacing[i] = abs(float(parts[i + 1]))  # diagonal axis vector
+        spacing[i] = abs(float(parts[i + 1])) * BOHR  # diagonal axis vector
 
     symbols: list[str] = []
     coords = np.empty((natoms, 3))
@@ -81,6 +92,7 @@ def read_cube(path: str | Path) -> tuple[Molecule, list[VolumeData]]:
         number = int(float(parts[0]))
         coords[a] = [float(v) for v in parts[2:5]]
         symbols.append(symbol_from_number(number) or "X")
+    coords *= BOHR  # the atomic coordinates are given in Bohr
 
     n_values = int(np.prod(dims))
     numbers = [
@@ -154,6 +166,24 @@ class _MoldenData:
         return len(self.aos)
 
 
+@dataclass(frozen=True)
+class AtomicOrbital:
+    """One atomic basis function (AO) available for visualization.
+
+    ``index`` is the position of the function in the basis AO list, so a unit
+    coefficient at that position selects exactly this function in the grid
+    evaluator. ``axis`` is -1 for an s function and 0/1/2 for the px/py/pz
+    cartesian components (the angular momenta the evaluator supports).
+    """
+
+    index: int
+    atom: int
+    l: int
+    axis: int
+    n_prim: int
+    shell: int
+
+
 _ANGULAR = {"s": 0, "p": 1, "d": 2, "f": 3, "g": 4}
 _N_FUNCS = {"s": 1, "p": 3, "d": 6, "f": 10, "g": 15}
 
@@ -223,10 +253,23 @@ def read_molden(path: str | Path) -> _MoldenData:
                 if section.endswith("AU"):
                     atoms_au = True
         elif section == "[GTO]":
-            m = re.match(r"^(\d+)\s*$", stripped)
-            if m:
+            # Atom block header: "N" or "N 0" (ORCA writes the 1-based atomic
+            # index followed by a second integer field). It is never matched
+            # while the primitives of a shell are still pending (those are two
+            # floats), which keeps it unambiguous.
+            parts = stripped.split()
+            is_block_header = (
+                bool(parts)
+                and parts[0].isdigit()
+                and (
+                    len(parts) == 1
+                    or re.fullmatch(r"[+-]?\d+", parts[1]) is not None
+                )
+                and (pending is None or prim_lines_left == 0)
+            )
+            if is_block_header:
                 flush_pending()
-                shell_atom = int(m.group(1)) - 1
+                shell_atom = int(parts[0]) - 1
                 continue
             m = re.match(r"^([spdfgh])\s+(\d+)\s+([\d.eE+-]+)\s*$", stripped)
             if m:
@@ -350,6 +393,81 @@ def _evaluate_molden_orbital_v2(
     )
 
 
+# ---------------------------------------------------------------------------
+# Atomic orbitals (basis functions of an individual atom)
+# ---------------------------------------------------------------------------
+
+_L_NAME = {0: "s", 1: "p", 2: "d", 3: "f", 4: "g"}
+_AXIS_NAME = ("x", "y", "z")
+
+
+def atomic_orbitals_for_atom(
+    basis: _MoldenData, atom: int
+) -> dict[int, list[AtomicOrbital]]:
+    """Basis functions centered on ``atom``, grouped by angular momentum.
+
+    Returns ``{l: [AtomicOrbital, ...]}`` with ``l`` in ascending order; the
+    AOs of a shell keep the cartesian file order (s, or px/py/pz).
+    """
+    from collections import defaultdict
+
+    by_shell: dict[int, list[int]] = defaultdict(list)
+    for idx, ao in enumerate(basis.aos):
+        by_shell[ao.shell].append(idx)
+
+    groups: dict[int, list[AtomicOrbital]] = defaultdict(list)
+    for sh_idx, sh in enumerate(basis.shells):
+        if sh.atom != atom:
+            continue
+        for ao_idx in by_shell.get(sh_idx, []):
+            ao = basis.aos[ao_idx]
+            groups[sh.l].append(
+                AtomicOrbital(
+                    index=ao_idx,
+                    atom=atom,
+                    l=sh.l,
+                    axis=ao.axis,
+                    n_prim=len(sh.exps),
+                    shell=sh_idx,
+                )
+            )
+    return {l: groups[l] for l in sorted(groups)}
+
+
+def atomic_orbital_label(ao: AtomicOrbital) -> str:
+    """Short label for an AO, e.g. ``"px (3)"`` or ``"s (6)"``."""
+    name = _L_NAME.get(ao.l, str(ao.l))
+    if ao.l == 0:
+        return f"{name} ({ao.n_prim})"
+    axis = _AXIS_NAME[ao.axis] if 0 <= ao.axis < 3 else str(ao.axis)
+    return f"{name}{axis} ({ao.n_prim})"
+
+
+def evaluate_atomic_orbital(
+    basis: _MoldenData,
+    ao: AtomicOrbital,
+    *,
+    half_width: float = 2.5,
+    n: int = 40,
+) -> VolumeData:
+    """Evaluate a single atomic basis function on a box around its atom.
+
+    Reuses the molecular-orbital grid evaluator with a unit coefficient
+    vector selecting exactly ``ao``, so both visualizations share the same
+    conventions (units, normalization, grid sampling).
+    """
+    if not 0 <= ao.index < basis.n_basis:
+        raise IndexError(f"no AO with index {ao.index}")
+    coeff = np.zeros(basis.n_basis)
+    coeff[ao.index] = 1.0
+    center = basis.molecule.coords[ao.atom]
+    volume = _evaluate_molden_orbital_v2(
+        basis, coeff, center - half_width, center + half_width, n
+    )
+    volume.label = atomic_orbital_label(ao)
+    return volume
+
+
 def load_volume_file(path: str | Path) -> VolumetricFile:
     """Load a cube or Molden file as a :class:`VolumetricFile`."""
     p = Path(path)
@@ -382,6 +500,8 @@ def load_volume_file(path: str | Path) -> VolumetricFile:
                 data.molecule.coords.max(axis=0) + 3.0, 40,
             )
 
-        return VolumetricFile(molecule=data.molecule, labels=labels, compute=compute, name=p.stem)
+        return VolumetricFile(
+            molecule=data.molecule, labels=labels, compute=compute, name=p.stem, basis=data
+        )
 
     raise ValueError(f"Unsupported volumetric file: {p.name}")

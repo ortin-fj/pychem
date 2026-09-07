@@ -4,9 +4,14 @@ A **modular** Python tool for molecular visualization and analysis, aiming to
 grow into a Molden-like program (structures, trajectories and isosurfaces:
 orbitals, electron densities, etc.).
 
+**Version 1.0.0.** PyChem is a regular Python package that installs a `pychem`
+command, so it can be launched from any terminal as `pychem file.xyz` (see
+[Install](#install)).
+
 ## Project status
 
-Current phase —  (step 5/14 of the plan)**.
+Current phase — Version **1.0.0** (installable
+command-line program).
 
 Done:
 
@@ -19,6 +24,8 @@ Done:
 - Covalent-radius bond guessing (`pychem/core/bonds.py`).
 - **XYZ** and **extended XYZ** reader/writer with `Lattice=...`; multi-frame
   reading to `Molecule` list or a `Trajectory`.
+- **PDB** reader (`pychem/io/pdb.py`): `ATOM`/`HETATM` records become a
+  `Molecule` (structure only — multi-model files use the first model).
 - Extensible format registry (`pychem/io/registry.py`).
 - Reusable **PyVista** molecular renderer (spheres per element + bond
   cylinders): works both in a window and in *offscreen* mode.
@@ -44,15 +51,48 @@ Done:
   in Angles/Dihedrals the central atom(s) are highlighted distinctly (magenta)
   from the involved endpoints (gold rings). Switching modes, clicking the same
   mode again or loading a new file clears the measurement and the selection.
+- **Atomic orbitals (Molden)**: a **Tools → Visualize atomic orbitals** menu
+  entry (enabled only when a `.molden` file is open) swaps the Volumetric panel
+  to an atomic-orbital mode: pick an atom (ID · symbol), the angular-momentum
+  type (s/p/...) and the specific basis function (e.g. one of several
+  contracted s functions on an atom). A first **"Plot AO"** click starts the
+  session — the button then disappears and any selection re-plots
+  automatically. Once an AO is plotted a **"Plot another AO"** button (below
+  Quality) reveals a second, separate picker (a box of its own, without
+  duplicating the section title) so a **second AO can be shown at the same
+  time**; at most two AOs are allowed and the button is removed as soon as the
+  second picker appears. The section title reads **Volumetric: AO** while
+  atomic orbitals are shown and **Volumetric: MO** otherwise (this two-AO
+  overlay is only for atomic orbitals). Isosurfaces use the same **isovalue**
+  (auto-suggested, editable) and **quality** (Medium/High) controls as the
+  molecular orbitals.
+- **Atom ID labels**: a checkable **Tools → Show ID label** entry overlays the
+  plain atom number on every atom (no text box). It stays compatible with atom
+  selection, geometric measurements, trajectory playback (labels follow each
+  pose) and volumetric/orbital isosurfaces. The numbers use the same green as
+  the side-panel titles (`#87D68D`), falling back to **black** on very light
+  atoms (e.g. white hydrogen) so they stay readable.
 - **PySide6 GUI** (`pychem/app/`): open a structure, export a PNG image,
   reset the camera, a fixed side panel with atom properties and trajectory
   controls, status bar.
-- `main.py` with three modes: GUI, *offscreen* render and text summary.
-- Tests with pytest (46 tests).
+- **Collapsible side panel**: Atom Properties is framed like the other
+  sections (Measurements, Trajectory, Volumetric); every section has a **bold
+  colored title** (accent `#87D68D`) and is **minimized/expanded** from its
+  header (click the title or the window-style button at its right, which
+  swaps between a minimize `—` and an expand `▢` glyph). The sections are
+  placed in a vertical splitter so each one can be **resized by dragging its
+  border**, and they always pack from the top of the panel (collapsed headers
+  line up at the top, free space stays at the bottom).
+- Installable command-line program: console script `pychem` (entry point
+  `pychem.cli:main`, legacy `main.py` launcher and `python -m pychem` kept).
+  Modes: GUI (default), *offscreen* render (`--screenshot`) and text summary
+  (`--info`). With no file argument the GUI opens empty — use File > Open
+  structure... to load a file.
+- Tests with pytest (69 tests).
 
 In progress / next:
 
-- More formats (PDB, Cube refinements, Molden with d/f shells...).
+- More formats (Cube refinements, Molden with d/f shells, analysis of quantum-mechanical outputs...).
 
 ## Layout
 
@@ -66,14 +106,36 @@ pychem/
 tests/
 ```
 
+## Install
+
+Requires **Python ≥ 3.12** and [uv](https://docs.astral.sh/uv/).
+
+### Editable install (development, from the source checkout)
+
+```bash
+uv sync                  # create .venv and install the project (editable)
+uv run pytest            # run the test suite
+uv run pychem file.xyz   # run the command inside the project
+```
+
+### Global command (available from any directory)
+
+```bash
+uv tool install --editable .   # install the `pychem` command globally
+pychem file.xyz                # now usable anywhere
+```
+
+(Use `uv tool install .` instead for a regular, non-editable global install;
+re-run it after pulling changes.) To uninstall later: `uv tool uninstall pychem`.
+
 ## Usage
 
 ```bash
-uv sync                    # install dependencies
-uv run pytest              # run the test suite
-
-uv run python main.py                  # open the GUI with guanine.xyz
-uv run python main.py file.xyz         # open the GUI with a file
-uv run python main.py --info           # text summary of the molecule
-uv run python main.py file.xyz --screenshot out.png  # headless PNG
+pychem                          # open the GUI empty; then File > Open structure... (Ctrl+O)
+pychem file.xyz                 # open the GUI with a structure/trajectory/volume
+pychem file.xyz --info          # text summary of the molecule
+pychem file.xyz --screenshot out.png  # headless render to PNG and exit
 ```
+
+For developers the same entry point can be run from the checkout without a
+global install: `uv run python main.py [file]` or `uv run python -m pychem [file]`.

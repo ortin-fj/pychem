@@ -1,6 +1,10 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "pychem"
-version = "0.1.0"
+version = "1.0.0"
 description = "Herramienta modular de visualización y análisis molecular"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -11,6 +15,12 @@ dependencies = [
     "pyside6>=6.7.0",
     "rdkit>=2026.3.5",
 ]
+
+[project.scripts]
+pychem = "pychem.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pychem"]
 
 [dependency-groups]
 dev = [

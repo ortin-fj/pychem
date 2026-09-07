@@ -94,8 +94,9 @@ def test_atom_selection_updates_panel(qapp):
     qapp.processEvents()
 
 
-def test_properties_dock_is_fixed_and_limited(qapp):
-    from PySide6.QtWidgets import QDockWidget
+def test_side_sections_collapsible_and_resizable(qapp):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QDockWidget, QSplitter
 
     from pychem.app import MainWindow
 
@@ -108,16 +109,153 @@ def test_properties_dock_is_fixed_and_limited(qapp):
         == QDockWidget.DockWidgetFeature.NoDockWidgetFeatures
     )
 
-    # The properties section must not exceed half of the panel height
-    panel = window._props_panel
-    panel.resize(240, 800)
-    # Hidden offscreen widgets do not get a resizeEvent; send one manually.
-    from PySide6.QtCore import QCoreApplication, QSize
-    from PySide6.QtGui import QResizeEvent
+    # The sections live in a vertical splitter (draggable separators).
+    assert isinstance(window._side_splitter, QSplitter)
+    assert window._side_splitter.orientation() == Qt.Orientation.Vertical
+    # Atom Properties, Measurements and Volumetric are siblings in it.
+    assert window._side_splitter.indexOf(window._props_box) >= 0
+    assert window._side_splitter.indexOf(window._meas_box) >= 0
+    assert window._side_splitter.indexOf(window._vol_box) >= 0
 
-    QCoreApplication.sendEvent(panel, QResizeEvent(panel.size(), QSize(0, 0)))
+    # Atom Properties is framed like the other sections (collapsible box).
+    props_box = window._props_box
+    assert props_box.title() == "Atom Properties"
+    # No native title check box anymore: each header exposes a right-aligned
+    # window-style button that swaps between minimize (—) and expand (▢).
+    assert not props_box.isCheckable()
+    assert not props_box.is_collapsed()
+    assert window._props_scroll is not None  # its (scrollable) body exists
+
+    from PySide6.QtWidgets import QToolButton
+
+    assert isinstance(props_box.toggle_button, QToolButton)
+    assert props_box.toggle_button.text() == props_box._MIN_GLYPH  # expanded
+
+    # Clicking the header button minimizes a section (body hidden) and the
+    # glyph swaps to the expand one; clicking again restores it.
+    assert not window._meas_box.isHidden()  # molecule loaded -> visible
+    window._meas_box.toggle_button.click()
     qapp.processEvents()
-    assert panel._scroll.maximumHeight() <= int(panel.height() * 0.5) + 1
+    assert window._meas_box.is_collapsed()
+    assert window._meas_buttons["bonds"].isHidden()
+    assert window._meas_box.toggle_button.text() == window._meas_box._EXPAND_GLYPH
+    assert window._meas_box.maximumHeight() <= window._meas_box.header_height()
+
+    window._meas_box.toggle_button.click()
+    qapp.processEvents()
+    assert not window._meas_box.is_collapsed()
+    assert not window._meas_buttons["bonds"].isHidden()
+    assert window._meas_box.toggle_button.text() == window._meas_box._MIN_GLYPH
+    # Expanding frees the height again so the body is not squeezed.
+    assert window._meas_box.maximumHeight() > window._meas_box.header_height()
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_section_header_click_toggles(qapp):
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=DATA / "water.xyz")
+    qapp.processEvents()
+
+    box = window._props_box
+    assert not box.is_collapsed()
+
+    def header_click(x=30.0, y=6.0):
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(x, y),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        release = QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            QPointF(x, y),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        box.mousePressEvent(press)
+        box.mouseReleaseEvent(release)
+
+    # A click on the title strip minimizes the section...
+    header_click()
+    qapp.processEvents()
+    assert box.is_collapsed()
+    assert window._props_scroll.isHidden()
+
+    # ...and a second click on the (now header-only) box expands it again.
+    header_click()
+    qapp.processEvents()
+    assert not box.is_collapsed()
+    assert not window._props_scroll.isHidden()
+
+    # Clicks below the header (over the body) must NOT toggle the section.
+    press = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        QPointF(30.0, 300.0),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    release = QMouseEvent(
+        QEvent.Type.MouseButtonRelease,
+        QPointF(30.0, 300.0),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    box.mousePressEvent(press)
+    box.mouseReleaseEvent(release)
+    qapp.processEvents()
+    assert not box.is_collapsed()
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_collapsing_all_keeps_side_panel_width(qapp):
+    from PySide6.QtCore import Qt
+
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=DATA / "water_breathing.xyz")
+    window.show()
+    window.resize(1200, 800)
+    qapp.processEvents()
+
+    # Give the side panel a comfortable, user-like width.
+    window.resizeDocks([window._props_dock], [320], Qt.Orientation.Horizontal)
+    qapp.processEvents()
+    qapp.processEvents()
+    width_before = window._props_dock.width()
+    assert width_before >= 300
+
+    # Collapsing every visible section must not narrow the side panel...
+    for box in (window._props_box, window._meas_box, window._traj_box):
+        box.set_collapsed(True)
+    qapp.processEvents()
+    qapp.processEvents()
+    assert window._props_dock.width() == width_before
+
+    # ...but the width must not be stuck either: while collapsed the panel can
+    # still be dragged (much) narrower again.
+    window.resizeDocks([window._props_dock], [170], Qt.Orientation.Horizontal)
+    qapp.processEvents()
+    qapp.processEvents()
+    assert window._props_dock.width() < width_before
+
+    # Expanding the sections again keeps whatever width was last set.
+    for box in (window._props_box, window._meas_box, window._traj_box):
+        box.set_collapsed(False)
+    qapp.processEvents()
+    qapp.processEvents()
+    assert window._props_dock.width() < width_before
 
     window.close()
     qapp.processEvents()
@@ -260,9 +398,9 @@ def test_volumetric_cube_plot_flow(qapp):
     assert window._iso_manual is True
     assert window._plotted_index == 0
 
-    # The Volumetric section is limited to about half the panel area.
-    panel_future = window._props_panel.future
-    assert window._vol_box.maximumHeight() <= max(120, panel_future.height() // 2) + 1
+    # The Volumetric section is an expandable sibling inside the side panel.
+    assert window._side_splitter.indexOf(window._vol_box) >= 0
+    assert not window._vol_box.is_collapsed()
 
     window.close()
     qapp.processEvents()
@@ -316,6 +454,290 @@ def test_measurements_flow(qapp):
     assert window._meas_mode is None
     assert len(window.renderer._meas_actors) == 0
     assert all(not b.isChecked() for b in window._meas_buttons.values())
+
+    window.close()
+    qapp.processEvents()
+
+
+# ---------------------------------------------------------------------------
+# Tools > Visualize atomic orbitals (Molden only)
+# ---------------------------------------------------------------------------
+
+
+def test_ao_menu_action_enabled_only_for_molden(qapp):
+    from pychem.app import MainWindow
+
+    # A plain XYZ molecule: no basis, so the action is disabled.
+    window = MainWindow(filename=DATA / "water.xyz")
+    qapp.processEvents()
+    assert window._act_visualize_ao is not None
+    assert not window._act_visualize_ao.isEnabled()
+    assert not window._act_visualize_ao.isChecked()
+    window.close()
+    qapp.processEvents()
+
+    # A Molden file: enabled, but the panel still starts on the MO page.
+    molden = Path(__file__).parent / "data" / "volumetric" / "single_point.molden"
+    window = MainWindow(filename=molden)
+    qapp.processEvents()
+    assert window._act_visualize_ao.isEnabled()
+    assert not window._act_visualize_ao.isChecked()
+    assert window._vol_stack.currentWidget() is window._mo_page
+    window.close()
+    qapp.processEvents()
+
+
+def test_atomic_orbitals_panel_flow(qapp):
+    from pychem.app import MainWindow
+
+    molden = Path(__file__).parent / "data" / "volumetric" / "single_point.molden"
+    window = MainWindow(filename=molden)
+    qapp.processEvents()
+
+    # Entering the AO mode through the Tools action swaps the panel page.
+    window._act_visualize_ao.trigger()
+    qapp.processEvents()
+    assert window._act_visualize_ao.isChecked()
+    assert window._vol_stack.currentWidget() is window._ao_page
+    # The section title announces atomic orbitals and the Plot button is
+    # available to start the session.
+    assert window._vol_box.title() == "Volumetric: AO"
+    assert not window._ao_plot_btn.isHidden()
+
+    # 16 atoms listed; the first one is a carbon with s/p shells selected.
+    assert window._ao_atom_combo.count() == 16
+    assert window._ao_atom_combo.currentText().startswith("1 · C")
+    types = [
+        window._ao_type_combo.itemText(i)
+        for i in range(window._ao_type_combo.count())
+    ]
+    assert types == ["s", "p"]
+    assert window._ao_orb_combo.count() > 0
+
+    # Isovalue/Quality appear only after the first plot.
+    assert window._ao_iso_row.isHidden()
+    assert window._ao_qual_row.isHidden()
+
+    window._on_plot_atomic_orbital()
+    qapp.processEvents()
+    assert len(window.vol_renderer._actors) >= 1
+    assert not window._ao_iso_row.isHidden()
+    assert not window._ao_qual_row.isHidden()
+    assert window._ao_iso_spin.value() > 0.0
+    assert window._ao_manual_iso is False
+    # After the first plot the button disappears: selections re-plot on their own.
+    assert window._ao_plot_btn.isHidden()
+
+    # A hydrogen only exposes s functions (its two contracted s shells); the
+    # new selection is plotted automatically.
+    window._ao_atom_combo.setCurrentIndex(3)
+    qapp.processEvents()
+    types = [
+        window._ao_type_combo.itemText(i)
+        for i in range(window._ao_type_combo.count())
+    ]
+    assert types == ["s"]
+    assert window._ao_orb_combo.count() == 2
+    assert len(window.vol_renderer._actors) >= 1
+
+    # A manual isovalue marks the value as user-set.
+    window._ao_iso_spin.setValue(0.05)
+    qapp.processEvents()
+    assert window._ao_manual_iso is True
+
+    # Toggling the action off returns to the molecular-orbitals page.
+    window._act_visualize_ao.trigger()
+    qapp.processEvents()
+    assert not window._act_visualize_ao.isChecked()
+    assert window._vol_stack.currentWidget() is window._mo_page
+    assert window._vol_box.title() == "Volumetric: MO"
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_second_atomic_orbital_overlay_flow(qapp):
+    from pychem.app import MainWindow
+
+    molden = Path(__file__).parent / "data" / "volumetric" / "single_point.molden"
+    window = MainWindow(filename=molden)
+    qapp.processEvents()
+    window._act_visualize_ao.trigger()
+    qapp.processEvents()
+    assert window._vol_stack.currentWidget() is window._ao_page
+
+    # The first plot button was renamed to "Plot AO".
+    assert window._ao_plot_btn.text() == "Plot AO"
+    # "Plot another AO" only makes sense once the first AO is on screen.
+    assert window._ao_plot_another_btn.isHidden()
+    # The button lives in the AO page only (the MO page has no such control)
+    # and the "Volumetric: AO" title is not duplicated by the second box.
+    assert window._ao_plot_another_btn.parent() is window._ao_page
+    assert window._vol_box.title() == "Volumetric: AO"
+
+    window._on_plot_atomic_orbital()
+    qapp.processEvents()
+    n_first = len(window.vol_renderer._actors)
+    assert n_first >= 1
+    assert window._ao_plotted
+    assert window._ao_plot_btn.isHidden()
+    # The offer to plot a second AO appears now...
+    assert not window._ao_plot_another_btn.isHidden()
+    # ...while the second picker itself is still hidden.
+    assert window._ao2_box.isHidden()
+
+    # Clicking "Plot another AO" reveals the second picker box and removes the
+    # button, so a third AO can never be requested.
+    window._ao_plot_another_btn.click()
+    qapp.processEvents()
+    assert not window._ao2_box.isHidden()
+    assert window._ao_plot_another_btn.isHidden()
+    assert window._ao2_atom_combo.count() == window._ao_atom_combo.count()
+
+    # Pick a different atom for the second AO and plot it.
+    window._ao2_atom_combo.setCurrentIndex(7)
+    qapp.processEvents()
+    window._ao2_plot_btn.click()
+    qapp.processEvents()
+    assert window._ao2_plotted
+    assert window._ao2_plot_btn.isHidden()
+    # Two AO overlays are now visible (more actors than with a single AO).
+    assert len(window.vol_renderer._actors) > n_first
+
+    # Editing either picker re-renders the pair (two overlays stay).
+    window._ao2_orb_combo.setCurrentIndex(0)
+    qapp.processEvents()
+    assert len(window.vol_renderer._actors) > n_first
+    window._ao_atom_combo.setCurrentIndex(3)
+    qapp.processEvents()
+    assert len(window.vol_renderer._actors) > n_first
+    assert window._ao2_plotted
+
+    # Leaving and re-entering the AO mode resets the whole session: the second
+    # picker is hidden again and a fresh "Plot AO" button is available.
+    window._act_visualize_ao.trigger()
+    qapp.processEvents()
+    window._act_visualize_ao.trigger()
+    qapp.processEvents()
+    assert window._vol_stack.currentWidget() is window._ao_page
+    assert window._ao2_box.isHidden()
+    assert not window._ao2_plotted
+    assert not window._ao_plotted
+    assert not window._ao_plot_btn.isHidden()
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_ao_roundtrip_through_mo_restores_second_offer(qapp):
+    from pychem.app import MainWindow
+
+    molden = Path(__file__).parent / "data" / "volumetric" / "single_point.molden"
+    window = MainWindow(filename=molden)
+    qapp.processEvents()
+
+    # Plot two atomic orbitals.
+    window._act_visualize_ao.trigger()
+    qapp.processEvents()
+    window._on_plot_atomic_orbital()
+    qapp.processEvents()
+    window._on_plot_another_ao()
+    qapp.processEvents()
+    window._ao2_atom_combo.setCurrentIndex(5)
+    qapp.processEvents()
+    window._ao2_plot_btn.click()
+    qapp.processEvents()
+    assert window._ao2_plotted
+    assert not window._ao2_box.isHidden()
+
+    # Leave AO mode (Tools off): the second picker must not stay open.
+    window._act_visualize_ao.trigger()
+    qapp.processEvents()
+    assert window._vol_stack.currentWidget() is window._mo_page
+    assert window._ao2_box.isHidden()
+    assert not window._ao2_plotted
+
+    # Plot a molecular orbital while on the MO page.
+    window._on_plot_isosurface()
+    qapp.processEvents()
+    assert window._plotted_index == 0
+
+    # Come back to AO mode and plot the first AO again: the offer to add a
+    # second atomic orbital must be back.
+    window._act_visualize_ao.trigger()
+    qapp.processEvents()
+    assert window._vol_stack.currentWidget() is window._ao_page
+    assert window._ao2_box.isHidden()
+    window._on_plot_atomic_orbital()
+    qapp.processEvents()
+    assert window._ao_plotted
+    assert not window._ao_plot_another_btn.isHidden()
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_show_id_label_toggle(qapp):
+    from pychem.app import MainWindow
+
+    # Without a molecule there is nothing to label.
+    window = MainWindow()
+    qapp.processEvents()
+    assert window._act_show_ids is not None
+    assert not window._act_show_ids.isEnabled()
+    assert not window._act_show_ids.isChecked()
+    window.close()
+    qapp.processEvents()
+
+    # A loaded molecule enables the action; toggling it draws the numbers.
+    window = MainWindow(filename=DATA / "water.xyz")
+    qapp.processEvents()
+    assert window._act_show_ids.isEnabled()
+    assert len(window.renderer._id_label_actors) == 0
+
+    window._act_show_ids.trigger()
+    qapp.processEvents()
+    assert window._act_show_ids.isChecked()
+    assert len(window.renderer._id_label_actors) > 0
+
+    # It coexists with an atom selection.
+    window._on_atom_picked(0)
+    qapp.processEvents()
+    assert window.renderer.selected_index == 0
+    assert len(window.renderer._id_label_actors) > 0
+
+    # Untoggling removes the numbers again.
+    window._act_show_ids.trigger()
+    qapp.processEvents()
+    assert not window._act_show_ids.isChecked()
+    assert len(window.renderer._id_label_actors) == 0
+    window.close()
+    qapp.processEvents()
+
+
+def test_show_id_labels_follow_trajectory_and_measurement(qapp):
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=DATA / "water_breathing.xyz")
+    qapp.processEvents()
+    window._act_show_ids.trigger()
+    qapp.processEvents()
+    assert len(window.renderer._id_label_actors) > 0
+
+    # A new pose redraws the molecule and keeps the labels on the atoms.
+    window._playback_t = 4.5
+    window._render_pose()
+    qapp.processEvents()
+    assert len(window.renderer._id_label_actors) > 0
+
+    # A geometric measurement does not remove them either.
+    window._meas_buttons["bonds"].setChecked(True)
+    qapp.processEvents()
+    window._on_atom_picked(0)
+    window._on_atom_picked(1)
+    qapp.processEvents()
+    assert len(window.renderer._meas_actors) > 0
+    assert len(window.renderer._id_label_actors) > 0
 
     window.close()
     qapp.processEvents()

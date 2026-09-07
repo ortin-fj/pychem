@@ -64,10 +64,10 @@ class Registry:
 # Global registry; format modules are imported to register themselves.
 _registry = Registry()
 
-from pychem.io import xyz  # noqa: E402  (registers .xyz)
+from pychem.io import pdb, xyz  # noqa: E402  (register .pdb/.ent and .xyz)
 
 # Future formats auto-register by adding their import here:
-# from pychem.io import pdb, cube, molden  # noqa: E402
+# from pychem.io import cube, molden  # noqa: E402
 
 
 def get_reader(path: str | Path):

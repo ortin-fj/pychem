@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 
 from PySide6.QtCore import QLocale, QTimer, Qt
-from PySide6.QtGui import QTextDocument
+from PySide6.QtGui import QMouseEvent, QResizeEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -36,24 +36,35 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
+    QSplitter,
+    QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 from pyvistaqt import QtInteractor
 
+from pychem import __version__ as PYCHEN_VERSION
 from pychem.core import geometry
 from pychem.core.bonds import guess_bonds, update_dynamic_bonds
 from pychem.core.molecule import Molecule
 from pychem.core.trajectory import Trajectory
 from pychem.core.volume import VolumeData
 from pychem.io import get_reader
-from pychem.io.volumetric import VolumetricFile, load_volume_file
+from pychem.io.volumetric import (
+    VolumetricFile,
+    atomic_orbital_label,
+    atomic_orbitals_for_atom,
+    evaluate_atomic_orbital,
+    load_volume_file,
+)
 from pychem.rendering import MolecularRenderer, RenderOptions
 from pychem.rendering.volume_renderer import VolumeRenderer
 
 # Extensions accepted by the "Open" dialog. Extended as formats are added.
-_OPEN_FILTER = "Structures (*.xyz);;All files (*)"
+_OPEN_FILTER = "Structures (*.xyz *.pdb);;All files (*)"
 
 # Trajectory playback tuning.
 _PLAYBACK_UPDATE_MS = 16  # refresh of the playback timer (~60 Hz)
@@ -130,59 +141,181 @@ class _IsoSpinBox(QDoubleSpinBox):
         self.setValue(value)
 
 
-class _PropertiesPanel(QWidget):
-    """Side-panel contents.
+class _CollapsibleBox(QGroupBox):
+    """A group box that minimizes/expands from its header strip.
 
-    The selected-atom properties section occupies at most half of the panel;
-    the remaining space is reserved for future controls (actions on the
-    molecule).
+    The header holds the section title (left) and a small window-style button
+    on the right that swaps between a minimize glyph (``—``) while the section
+    is expanded and an expand glyph (``▢``) while it is collapsed. Clicking
+    the header strip itself (title included) toggles the section too, instead
+    of the old native title check box.
+
+    While collapsed the body widgets are hidden and the box is capped to the
+    header height, so the owning panel can pack the sections from the top.
     """
 
-    # Maximum height of the properties area, as a fraction of the panel
-    # height. Set to half on purpose so the selected-atom information has
-    # room to breathe.
-    _MAX_HEIGHT_FRACTION = 0.5
+    # Glyphs of the header toggle button (window-style minimize/maximize).
+    _MIN_GLYPH = "\u2014"  # shown while expanded: click to minimize
+    _EXPAND_GLYPH = "\u25a2"  # shown while collapsed: click to expand
+    # Extra vertical space above the text that makes up the header strip.
+    _HEADER_PAD = 26
+
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+        super().__init__(title, parent)
+        self._collapsed = False
+        self._header_pressed = False
+        self._open_height: int | None = None  # body height restored on expand
+        # The native title check box is not used: the toggle lives in the
+        # header button (and in the header strip itself).
+        self.setCheckable(False)
+        # Bold title; the panel's QSS resets the body widgets to normal weight
+        # so only the section header is emphasised.
+        font = self.font()
+        font.setBold(True)
+        self.setFont(font)
+
+        # Small window-style button pinned to the right of the header strip.
+        self.toggle_button = QToolButton(self)
+        self.toggle_button.setObjectName("sectionToggleButton")
+        self.toggle_button.setAutoRaise(True)
+        self.toggle_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.toggle_button.setFixedSize(20, 18)
+        self.toggle_button.clicked.connect(self.toggle)
+        self._refresh_button()
+
+    # -- state ---------------------------------------------------------------
+
+    def is_collapsed(self) -> bool:
+        return self._collapsed
+
+    def set_collapsed(self, collapsed: bool) -> None:
+        """Collapse (hide the body) or expand (show it again)."""
+        collapsed = bool(collapsed)
+        if collapsed == self._collapsed:
+            return
+        if collapsed:
+            # Remember the current full height (the splitter may have given the
+            # section more room than its content) so expanding can restore it.
+            if self.height() > self.header_height():
+                self._open_height = self.height()
+        self._collapsed = collapsed
+        self._apply_state()
+        # Let the owning panel repack the sections from the top.
+        self.toggled.emit(not collapsed)
+
+    def toggle(self) -> None:
+        self.set_collapsed(not self._collapsed)
+
+    # -- presentation --------------------------------------------------------
+
+    def header_height(self) -> int:
+        """Height of the header strip (the whole box when collapsed)."""
+        text_h = max(self.fontMetrics().height(), self.toggle_button.height())
+        return text_h + self._HEADER_PAD
+
+    def _in_header(self, y: float) -> bool:
+        return y <= self.header_height()
+
+    def _refresh_button(self) -> None:
+        btn = self.toggle_button
+        if self._collapsed:
+            btn.setText(self._EXPAND_GLYPH)
+            btn.setToolTip("Expand")
+        else:
+            btn.setText(self._MIN_GLYPH)
+            btn.setToolTip("Minimize")
+
+    def _apply_state(self) -> None:
+        self._set_body_visible(not self._collapsed)
+        self._refresh_button()
+
+    def _set_body_visible(self, visible: bool) -> None:
+        lay = self.layout()
+        if lay is not None:
+            for i in range(lay.count()):
+                item = lay.itemAt(i)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setVisible(visible)
+        if visible:
+            # Free the height again: the splitter redistributes the space.
+            self.setMaximumHeight(16777215)
+        else:
+            # Only the header remains; cap the section to its height so the
+            # splitter cannot stretch the collapsed frame to fill the gap.
+            self.setMaximumHeight(self.header_height())
+
+    # -- header interaction --------------------------------------------------
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt API)
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._in_header(event.position().y())
+        ):
+            self._header_pressed = True
+            event.accept()
+            return
+        self._header_pressed = False
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt API)
+        if (
+            self._header_pressed
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._in_header(event.position().y())
+        ):
+            self._header_pressed = False
+            self.toggle()
+            event.accept()
+            return
+        self._header_pressed = False
+        super().mouseReleaseEvent(event)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 (Qt API)
+        super().resizeEvent(event)
+        self._place_button()
+
+    def _place_button(self) -> None:
+        """Pin the toggle button to the top-right corner of the header."""
+        btn = self.toggle_button
+        btn.move(max(0, self.width() - btn.width() - 6), 3)
+        btn.raise_()
+
+
+class _PropertiesPanel(QWidget):
+    """Right side panel: vertically stacked collapsible sections.
+
+    The sections (Atom Properties, Measurements, Trajectory and Volumetric)
+    live in a vertical ``QSplitter``: drag the separator between two sections
+    to resize them, or use a section header (the title or the window-style
+    button on its right) to minimize it and expand it again.
+    """
+
+    # Section titles: bold, accent color (see also the group boxes' QSS).
+    # The descendant rule keeps the section *bodies* at normal weight (they
+    # must not inherit the bold used for the headers).
+    TITLE_STYLE = (
+        "QGroupBox QWidget { font-weight: normal; }"
+        "QGroupBox::title { color: #87D68D; font-weight: bold;"
+        " subcontrol-origin: margin; left: 12px; padding: 0 3px; }"
+        "QToolButton#sectionToggleButton { border: none; background: transparent;"
+        " color: #87D68D; font-weight: bold; }"
+        "QToolButton#sectionToggleButton:hover { color: #b3edba; }"
+        "QFrame#aoSecondBox { border: 1px solid #c3cfc3; border-radius: 4px; }"
+    )
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.on_panel_resized = None  # optional callback (set by the owner)
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(0)
-
-        # Properties section (scrollable, capped at half the panel height).
-        self._scroll = QScrollArea(self)
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        label = QLabel()
-        label.setWordWrap(True)
-        label.setMargin(8)
-        label.setTextFormat(Qt.TextFormat.RichText)
-        self._scroll.setWidget(label)
-        self.label = label
-        # The properties area only takes the room its content needs (the cap is
-        # applied in resizeEvent), so the sections below sit right underneath
-        # it instead of leaving a large blank band between them.
-        outer.addWidget(self._scroll, stretch=0)
-
-        # Bottom area reserved for future actions (Trajectory / Volumetric).
-        self.future = QWidget(self)
-        self.future_layout = QVBoxLayout(self.future)
-        self.future_layout.setContentsMargins(6, 6, 6, 6)
-        outer.addWidget(self.future, stretch=3)
-
-    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
-        self._scroll.setMaximumHeight(
-            max(60, int(self.height() * self._MAX_HEIGHT_FRACTION))
-        )
-        # Let the owner re-fit the lower sections (e.g. the Volumetric box)
-        # once the panel has reached its final size.
-        if self.on_panel_resized is not None:
-            self.on_panel_resized()
-        super().resizeEvent(event)
+        self.splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(6)
+        outer.addWidget(self.splitter)
+        self.label: QLabel | None = None  # Atom Properties rich label
+        self.setStyleSheet(self.TITLE_STYLE)
 
 
 class MainWindow(QMainWindow):
@@ -208,7 +341,13 @@ class MainWindow(QMainWindow):
         self._volume_cache: dict[int, VolumeData] = {}
         self._plotted_index: int | None = None
         self._iso_manual = False
-        self._props_fit_scheduled = False
+        # Atomic orbital visualization (Tools > Visualize atomic orbitals).
+        self._act_visualize_ao = None
+        self._ao_cache: dict[int, VolumeData] = {}
+        self._ao_plotted = False
+        self._ao_manual_iso = False
+        self._ao_filling = False
+        self._ao2_plotted = False
         self._meas_mode: str | None = None
         self._meas_atoms: list[int] = []
         self._meas_buttons: dict[str, QPushButton] = {}
@@ -223,11 +362,7 @@ class MainWindow(QMainWindow):
         self._setup_picking()
         self._build_trajectory_controls()
         self._build_volumetric_controls()
-        # Bottom stretch: whichever section is visible (Trajectory or
-        # Volumetric) stays pinned to the top, right below Atom Properties,
-        # and any leftover space collects at the very bottom of the panel.
-        # Future controls must be inserted before this stretch.
-        self._future_layout.addStretch(1)
+        self._build_side_stretch()
         self.statusBar().showMessage("Ready. Use File > Open to load a structure.")
 
         if filename is not None:
@@ -246,26 +381,154 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(frame)
 
     def _build_properties_dock(self) -> None:
-        """Fixed side panel (no close/float buttons).
+        """Fixed side panel: collapsible/resizable sections in a splitter.
 
-        The properties section is limited to half the panel height; the rest
-        is reserved for future controls.
+        The Atom Properties section is framed like the other sections and
+        every section can be collapsed from its header and resized by
+        dragging the splitter separators.
         """
-        dock = QDockWidget("Atom Properties", self)
+        dock = QDockWidget("", self)
         # Permanent panel: no close/float button, and it cannot be undocked
         # or moved.
         dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
         panel = _PropertiesPanel(self)
-        panel.label.setText(self._properties_html(None))
+
+        # --- Atom Properties section ---------------------------------------
+        props_box = _CollapsibleBox("Atom Properties")
+        props_box.toggled.connect(self._on_section_toggled)
+        props_layout = QVBoxLayout(props_box)
+        props_layout.setContentsMargins(8, 12, 8, 8)
+        scroll = QScrollArea(props_box)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        label = QLabel()
+        label.setWordWrap(True)
+        label.setMargin(8)
+        label.setTextFormat(Qt.TextFormat.RichText)
+        scroll.setWidget(label)
+        props_layout.addWidget(scroll)
+        panel.splitter.addWidget(props_box)
+
         dock.setWidget(panel)
         self._props_panel = panel
-        self._props_label = panel.label
-        self._future_layout = panel.future_layout
+        self._props_label = label
+        panel.label = label
+        self._props_scroll = scroll
+        self._props_box = props_box
         self._props_dock = dock
-        # Re-fit the side-panel sections after a resize (their heights depend
-        # on the final panel size, only known once it is laid out).
-        panel.on_panel_resized = self._schedule_sections_fit
+        self._side_splitter = panel.splitter
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        panel.label.setText(self._properties_html(None))
+
+    def _build_side_stretch(self) -> None:
+        """Append a stretch cell to the side splitter.
+
+        The ``QSplitter`` cannot be taller than the sum of its children's
+        maximum heights, so when every section is minimized it shrinks and the
+        surrounding layout would center it in the panel. A trailing spacer
+        that is allowed to grow absorbs the leftover vertical space instead,
+        which keeps the sections (minimized or not) packed at the top of the
+        side panel.
+        """
+        spacer = QWidget(self._side_splitter)
+        policy = spacer.sizePolicy()
+        policy.setVerticalPolicy(QSizePolicy.Policy.Expanding)
+        spacer.setSizePolicy(policy)
+        spacer.setObjectName("sideStretch")
+        self._side_splitter.addWidget(spacer)
+        self._side_spacer = spacer
+
+    def _on_section_toggled(self, _checked: bool) -> None:
+        """A section header was collapsed/expanded: keep width, repack top."""
+        self._stabilize_panel_width()
+        self._pack_sections()
+
+    def _stabilize_panel_width(self) -> None:
+        """Keep the side panel width when every visible section is collapsed.
+
+        Hiding the sections drops the content-driven minimum width of the
+        dock, so a dock whose width was never set by the user would auto-shrink
+        to that new minimum (e.g. 270 -> 160 px). Committing the current width
+        back into the dock layout at that moment preserves it, without pinning
+        any minimum: the user can still drag the panel narrower afterwards,
+        down to the (smaller) collapsed content minimum.
+        """
+        dock = self._props_dock
+        if not dock.isVisible():
+            return
+        splitter = self._side_splitter
+        visible = [
+            splitter.widget(i)
+            for i in range(splitter.count())
+            if isinstance(splitter.widget(i), _CollapsibleBox)
+            and not splitter.widget(i).isHidden()
+        ]
+        if not visible or not all(box.is_collapsed() for box in visible):
+            return
+        width = dock.width()
+        if width > 0:
+            self.resizeDocks([dock], [width], Qt.Orientation.Horizontal)
+
+    def _pack_sections(self) -> None:
+        """Repack the visible side sections from the top of the panel.
+
+        Collapsed sections stay capped at their header height, expanded ones
+        keep the height they had before the toggle (or their natural size on
+        the first toggle) and the trailing spacer absorbs every pixel they do
+        not use. The headers therefore always line up at the top of the panel
+        after a minimize/expand.
+        """
+        splitter = self._side_splitter
+        count = splitter.count()
+        current = splitter.sizes()
+        spacer = getattr(self, "_side_spacer", None)
+        # Remember the current real size of every expanded section (this also
+        # follows manual separator drags) so a collapse/expand cycle can give
+        # each section back the height it had.
+        for i in range(count):
+            w = splitter.widget(i)
+            if (
+                isinstance(w, _CollapsibleBox)
+                and not w.isHidden()
+                and not w.is_collapsed()
+                and current[i] > w.header_height()
+            ):
+                w._open_height = current[i]
+        # Visible children that take vertical room: shown sections + the spacer.
+        visible = [
+            (i, splitter.widget(i))
+            for i in range(count)
+            if (isinstance(splitter.widget(i), _CollapsibleBox) and not splitter.widget(i).isHidden())
+            or splitter.widget(i) is spacer
+        ]
+        sizes = list(current)
+        used = 0
+        for i, w in visible:
+            if not isinstance(w, _CollapsibleBox):
+                continue  # the spacer: filled with the leftover below
+            if w.is_collapsed():
+                sizes[i] = w.header_height()
+            else:
+                open_h = w._open_height
+                if open_h is None:
+                    open_h = max(w.sizeHint().height(), w.header_height())
+                sizes[i] = max(open_h, w.header_height())
+            used += sizes[i]
+        # Give the leftover vertical space to the spacer at the bottom.
+        if spacer is not None:
+            handles = max(0, len(visible) - 1) * splitter.handleWidth()
+            avail = splitter.height() - handles
+            idx = -1
+            for i in range(count):
+                if splitter.widget(i) is spacer:
+                    idx = i
+                    break
+            if idx >= 0:
+                sizes[idx] = max(0, avail - used)
+        splitter.setSizes(sizes)
 
     def _setup_picking(self) -> None:
         """Enable atom selection with the left mouse button.
@@ -313,6 +576,22 @@ class MainWindow(QMainWindow):
         act_reset.setShortcut("Ctrl+R")
         act_reset.triggered.connect(self.reset_camera)
 
+        tools_menu = menu.addMenu("&Tools")
+        act_ao = tools_menu.addAction("&Visualize atomic orbitals")
+        # Only meaningful for Molden files, which carry the basis functions.
+        act_ao.setCheckable(True)
+        act_ao.setEnabled(False)
+        act_ao.triggered.connect(self._on_visualize_ao_toggled)
+        self._act_visualize_ao = act_ao
+
+        act_ids = tools_menu.addAction("&Show ID label")
+        # Overlays the atom number on every atom; works for any molecule on
+        # screen (plain structures, trajectories and volumetric files).
+        act_ids.setCheckable(True)
+        act_ids.setEnabled(False)
+        act_ids.triggered.connect(self._on_show_ids_toggled)
+        self._act_show_ids = act_ids
+
         help_menu = menu.addMenu("&Help")
         act_about = help_menu.addAction("&About PyChem")
         act_about.triggered.connect(self.show_about)
@@ -355,6 +634,10 @@ class MainWindow(QMainWindow):
         self._volume_cache = {}
         self._plotted_index = None
         self._iso_manual = False
+        self._ao_cache = {}
+        self._ao_plotted = False
+        self._ao_manual_iso = False
+        self._ao2_plotted = False
         self._reset_measurement_mode()
 
         trajectory = data if isinstance(data, Trajectory) else None
@@ -373,6 +656,17 @@ class MainWindow(QMainWindow):
         self.renderer.select_atom(None)
         self._update_properties(None)
 
+        # Atomic-orbital mode is only available for Molden files and the
+        # volumetric panel always restarts on the molecular-orbitals page.
+        has_basis = volfile is not None and getattr(volfile, "basis", None) is not None
+        if self._act_visualize_ao is not None:
+            self._act_visualize_ao.setEnabled(has_basis)
+            if not has_basis and self._act_visualize_ao.isChecked():
+                self._act_visualize_ao.blockSignals(True)
+                self._act_visualize_ao.setChecked(False)
+                self._act_visualize_ao.blockSignals(False)
+        self._exit_ao_mode()
+
         if trajectory is not None:
             self._activate_trajectory(trajectory, path)
             self._set_volumetric_controls_visible(False)
@@ -384,6 +678,15 @@ class MainWindow(QMainWindow):
             self._set_volumetric_controls_visible(False)
 
         self._set_measurement_controls_visible(molecule is not None)
+        # "Show ID label" needs an actual molecule on screen.
+        if self._act_show_ids is not None:
+            self._act_show_ids.setEnabled(molecule is not None)
+            if molecule is None and self._act_show_ids.isChecked():
+                self._act_show_ids.blockSignals(True)
+                self._act_show_ids.setChecked(False)
+                self._act_show_ids.blockSignals(False)
+                self.renderer.set_id_labels(False)
+        self._stabilize_panel_width()
 
         if trajectory is not None:
             self.setWindowTitle(
@@ -412,7 +715,6 @@ class MainWindow(QMainWindow):
         self._iso_row.setVisible(False)
         self._qual_row.setVisible(False)
         self._set_volumetric_controls_visible(True)
-        self._limit_volumetric_height()
 
     def _activate_trajectory(self, trajectory: Trajectory, path: Path) -> None:
         """Set up the playback state and controls for ``trajectory``."""
@@ -459,18 +761,18 @@ class MainWindow(QMainWindow):
 
         atom = mol.get_atom(index)
         lines = [
-            f"<b>ID {index + 1} · {atom.symbol}</b>",
-            "<b>Coordinates (Å):</b>",
+            f"ID {index + 1} · {atom.symbol}",
+            "Coordinates (Å):",
             "<table cellspacing='0' cellpadding='1'>"
-            f"<tr><td><b>x</b></td><td>{atom.x:.4f}</td></tr>"
-            f"<tr><td><b>y</b></td><td>{atom.y:.4f}</td></tr>"
-            f"<tr><td><b>z</b></td><td>{atom.z:.4f}</td></tr>"
+            f"<tr><td>x</td><td>{atom.x:.4f}</td></tr>"
+            f"<tr><td>y</td><td>{atom.y:.4f}</td></tr>"
+            f"<tr><td>z</td><td>{atom.z:.4f}</td></tr>"
             "</table>",
         ]
 
         neighbors = self.renderer.neighbor_indices(index)
         if neighbors.size:
-            lines.append(f"<b>Bonds ({neighbors.size}):</b>")
+            lines.append(f"Bonds ({neighbors.size}):")
             for j in neighbors:
                 d = float(np.linalg.norm(mol.coords[index] - mol.coords[j]))
                 lines.append(
@@ -482,8 +784,6 @@ class MainWindow(QMainWindow):
 
     def _update_properties(self, index: int | None, update_status: bool = True) -> None:
         self._props_label.setText(self._properties_html(index))
-        # Re-fit the Atom Properties area to its new content on the next tick.
-        self._schedule_properties_fit()
         if update_status and self.renderer.molecule is not None and index is not None:
             atom = self.renderer.molecule.get_atom(index)
             self.statusBar().showMessage(f"Selected atom: {index + 1} ({atom.symbol})")
@@ -492,7 +792,8 @@ class MainWindow(QMainWindow):
 
     def _build_measurement_controls(self) -> None:
         """Build the Measurements section: three exclusive mode buttons."""
-        box = QGroupBox("Measurements")
+        box = _CollapsibleBox("Measurements")
+        box.toggled.connect(self._on_section_toggled)
         layout = QVBoxLayout(box)
         layout.setSpacing(4)
         layout.setContentsMargins(10, 8, 10, 8)
@@ -514,7 +815,7 @@ class MainWindow(QMainWindow):
             )
             layout.addWidget(btn)
             self._meas_buttons[key] = btn
-        self._future_layout.addWidget(box)
+        self._side_splitter.addWidget(box)
         self._meas_box = box
         box.setVisible(False)
 
@@ -642,7 +943,8 @@ class MainWindow(QMainWindow):
         self._playback_timer = QTimer(self)
         self._playback_timer.timeout.connect(self._traj_tick)
 
-        box = QGroupBox("Trajectory")
+        box = _CollapsibleBox("Trajectory")
+        box.toggled.connect(self._on_section_toggled)
         layout = QVBoxLayout(box)
         # Vertical gap between rows and inner margins of the group; tweak
         # ``_TRAJ_LAYOUT_SPACING`` / ``_TRAJ_LAYOUT_MARGIN`` at the top of
@@ -719,7 +1021,7 @@ class MainWindow(QMainWindow):
         self._slider.sliderMoved.connect(self._on_slider_moved)
         self._slider.valueChanged.connect(self._on_slider_value)
 
-        self._future_layout.addWidget(box)
+        self._side_splitter.addWidget(box)
         self._traj_box = box
         box.setVisible(False)
 
@@ -889,9 +1191,31 @@ class MainWindow(QMainWindow):
     # -- volumetric isosurfaces ---------------------------------------------
 
     def _build_volumetric_controls(self) -> None:
-        """Build the volumetric panel in the lower part of the side panel."""
-        box = QGroupBox("Volumetric")
-        layout = QVBoxLayout(box)
+        """Build the volumetric panel in the lower part of the side panel.
+
+        The group box holds two interchangeable pages (a ``QStackedWidget``):
+
+        - Molecular orbitals: an info line, a "Plot isosurface" button and a
+          list of the fields/orbitals.
+        - Atomic orbitals (Tools menu, Molden files): pick an atom, the
+          angular-momentum type (s/p/...) and one of its basis functions.
+
+        Both pages mirror the same Isovalue/Quality rows (only revealed after
+        the first plot) and drive the shared :class:`VolumeRenderer`.
+        """
+        box = _CollapsibleBox("Volumetric")
+        box.toggled.connect(self._on_section_toggled)
+        outer = QVBoxLayout(box)
+        outer.setSpacing(6)
+        self._vol_stack = QStackedWidget(box)
+        outer.addWidget(self._vol_stack)
+        # The title reflects which page is active (molecular/atomic orbitals).
+        box.setTitle("Volumetric: MO")
+
+        # ---- page: molecular orbitals ------------------------------------
+        mo_page = QWidget()
+        layout = QVBoxLayout(mo_page)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
         self._vol_info = QLabel("")
@@ -940,7 +1264,144 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self._vol_list)
 
-        self._future_layout.addWidget(box)
+        self._mo_page = mo_page
+        self._vol_stack.addWidget(mo_page)
+
+        # ---- page: atomic orbitals ----------------------------------------
+        ao_page = QWidget()
+        ao_layout = QVBoxLayout(ao_page)
+        ao_layout.setContentsMargins(0, 0, 0, 0)
+        ao_layout.setSpacing(6)
+
+        atom_row = QWidget()
+        atom_layout = QHBoxLayout(atom_row)
+        atom_layout.setContentsMargins(0, 0, 0, 0)
+        atom_layout.addWidget(QLabel("Atom"))
+        self._ao_atom_combo = QComboBox()
+        self._ao_atom_combo.currentIndexChanged.connect(self._on_ao_atom_changed)
+        atom_layout.addWidget(self._ao_atom_combo, 1)
+        ao_layout.addWidget(atom_row)
+
+        type_row = QWidget()
+        type_layout = QHBoxLayout(type_row)
+        type_layout.setContentsMargins(0, 0, 0, 0)
+        type_layout.addWidget(QLabel("Type"))
+        self._ao_type_combo = QComboBox()
+        self._ao_type_combo.currentIndexChanged.connect(self._on_ao_type_changed)
+        type_layout.addWidget(self._ao_type_combo, 1)
+        ao_layout.addWidget(type_row)
+
+        orb_row = QWidget()
+        orb_layout = QHBoxLayout(orb_row)
+        orb_layout.setContentsMargins(0, 0, 0, 0)
+        orb_layout.addWidget(QLabel("Orbital"))
+        self._ao_orb_combo = QComboBox()
+        self._ao_orb_combo.currentIndexChanged.connect(
+            self._on_ao_orbital_changed
+        )
+        orb_layout.addWidget(self._ao_orb_combo, 1)
+        ao_layout.addWidget(orb_row)
+
+        self._ao_plot_btn = QPushButton("Plot AO")
+        self._ao_plot_btn.setMinimumHeight(32)
+        self._ao_plot_btn.clicked.connect(self._on_plot_atomic_orbital)
+        ao_layout.addWidget(self._ao_plot_btn)
+
+        # Isovalue/Quality rows mirroring the molecular-orbital ones: hidden
+        # until the first plot, then an editable, auto-suggested isovalue.
+        ao_iso_row = QWidget()
+        ao_iso_layout = QHBoxLayout(ao_iso_row)
+        ao_iso_layout.setContentsMargins(0, 0, 0, 0)
+        ao_iso_layout.addWidget(QLabel("Isovalue"))
+        self._ao_iso_spin = _IsoSpinBox()
+        self._ao_iso_spin.setRange(1e-9, 1e6)
+        self._ao_iso_spin.setValue(0.05)
+        self._ao_iso_spin.valueChanged.connect(self._on_ao_iso_changed)
+        ao_iso_layout.addWidget(self._ao_iso_spin, 1)
+        ao_layout.addWidget(ao_iso_row)
+        ao_iso_row.setVisible(False)
+        self._ao_iso_row = ao_iso_row
+
+        ao_qual_row = QWidget()
+        ao_qual_layout = QHBoxLayout(ao_qual_row)
+        ao_qual_layout.setContentsMargins(0, 0, 0, 0)
+        ao_qual_layout.addWidget(QLabel("Quality"))
+        self._ao_quality_combo = QComboBox()
+        self._ao_quality_combo.addItems(["Medium", "High"])
+        self._ao_quality_combo.setCurrentText("Medium")
+        self._ao_quality_combo.currentTextChanged.connect(
+            self._on_ao_quality_changed
+        )
+        ao_qual_layout.addWidget(self._ao_quality_combo, 1)
+        ao_layout.addWidget(ao_qual_row)
+        ao_qual_row.setVisible(False)
+        self._ao_qual_row = ao_qual_row
+
+        # "Plot another AO": once the first atomic orbital is on screen the
+        # user can add a second one. It is a separate box (no duplicated
+        # "Volumetric: AO" title) and at most two AOs can be shown at once.
+        self._ao_plot_another_btn = QPushButton("Plot another AO")
+        self._ao_plot_another_btn.setMinimumHeight(32)
+        self._ao_plot_another_btn.clicked.connect(self._on_plot_another_ao)
+        ao_layout.addWidget(self._ao_plot_another_btn)
+        self._ao_plot_another_btn.setVisible(False)
+
+        # Second atomic-orbital picker: Atom/Type/Orbital + its own "Plot AO"
+        # button. It reuses the Isovalue/Quality rows above and is revealed by
+        # "Plot another AO".
+        ao2_box = QFrame(ao_page)
+        ao2_box.setObjectName("aoSecondBox")
+        ao2_layout = QVBoxLayout(ao2_box)
+        ao2_layout.setContentsMargins(8, 8, 8, 8)
+        ao2_layout.setSpacing(6)
+
+        ao2_atom_row = QWidget()
+        ao2_atom_layout = QHBoxLayout(ao2_atom_row)
+        ao2_atom_layout.setContentsMargins(0, 0, 0, 0)
+        ao2_atom_layout.addWidget(QLabel("Atom"))
+        self._ao2_atom_combo = QComboBox()
+        self._ao2_atom_combo.currentIndexChanged.connect(
+            self._on_ao2_atom_changed
+        )
+        ao2_atom_layout.addWidget(self._ao2_atom_combo, 1)
+        ao2_layout.addWidget(ao2_atom_row)
+
+        ao2_type_row = QWidget()
+        ao2_type_layout = QHBoxLayout(ao2_type_row)
+        ao2_type_layout.setContentsMargins(0, 0, 0, 0)
+        ao2_type_layout.addWidget(QLabel("Type"))
+        self._ao2_type_combo = QComboBox()
+        self._ao2_type_combo.currentIndexChanged.connect(
+            self._on_ao2_type_changed
+        )
+        ao2_type_layout.addWidget(self._ao2_type_combo, 1)
+        ao2_layout.addWidget(ao2_type_row)
+
+        ao2_orb_row = QWidget()
+        ao2_orb_layout = QHBoxLayout(ao2_orb_row)
+        ao2_orb_layout.setContentsMargins(0, 0, 0, 0)
+        ao2_orb_layout.addWidget(QLabel("Orbital"))
+        self._ao2_orb_combo = QComboBox()
+        self._ao2_orb_combo.currentIndexChanged.connect(
+            self._on_ao2_orbital_changed
+        )
+        ao2_orb_layout.addWidget(self._ao2_orb_combo, 1)
+        ao2_layout.addWidget(ao2_orb_row)
+
+        self._ao2_plot_btn = QPushButton("Plot AO")
+        self._ao2_plot_btn.setMinimumHeight(32)
+        self._ao2_plot_btn.clicked.connect(self._on_plot_ao2)
+        ao2_layout.addWidget(self._ao2_plot_btn)
+
+        ao_layout.addWidget(ao2_box)
+        ao2_box.setVisible(False)
+        self._ao2_box = ao2_box
+
+        self._ao_page = ao_page
+        self._vol_stack.addWidget(ao_page)
+        self._vol_stack.setCurrentWidget(mo_page)
+
+        self._side_splitter.addWidget(box)
         self._vol_box = box
         box.setVisible(False)
 
@@ -957,50 +1418,6 @@ class MainWindow(QMainWindow):
         if self._plotted_index is not None:
             self._plot_volume(self._plotted_index)
 
-    def _schedule_sections_fit(self) -> None:
-        """Re-fit the side-panel sections after a resize of the panel."""
-        QTimer.singleShot(0, self._limit_volumetric_height)
-        self._schedule_properties_fit()
-
-    def _schedule_properties_fit(self) -> None:
-        """Fit the Atom Properties height to its text on the next idle tick."""
-        if self._props_fit_scheduled:
-            return
-        self._props_fit_scheduled = True
-        QTimer.singleShot(0, self._apply_properties_fit)
-
-    def _apply_properties_fit(self) -> None:
-        """Give the properties scroll the height of its text content (capped)."""
-        self._props_fit_scheduled = False
-        if not hasattr(self, "_props_panel"):
-            return
-        panel = self._props_panel
-        cap = max(60, int(panel.height() * panel._MAX_HEIGHT_FRACTION))
-        needed = self._properties_content_height(panel.label)
-        # Pin the scroll area (min == max) to the measured text height: it
-        # grows with the content up to the cap and shrinks back when the
-        # content gets shorter. Pinning both bounds is required because the
-        # scroll area does not auto-size to its child.
-        height = min(max(60, needed), cap)
-        panel._scroll.setMinimumHeight(height)
-        panel._scroll.setMaximumHeight(height)
-
-    def _properties_content_height(self, label: QLabel) -> int:
-        """Text height of ``label`` wrapped at its current width."""
-        doc = QTextDocument()
-        doc.setDefaultFont(label.font())
-        doc.setHtml(label.text())
-        margin = label.margin()
-        doc.setTextWidth(max(1, label.width() - 2 * margin))
-        return int(doc.size().height()) + 2 * margin
-
-    def _limit_volumetric_height(self) -> None:
-        """Keep the Volumetric section to about half of the free panel area."""
-        if not (hasattr(self, "_props_panel") and hasattr(self, "_vol_box")):
-            return
-        available = self._props_panel.future.height()
-        self._vol_box.setMaximumHeight(max(120, available // 2))
-
     def _on_plot_isosurface(self) -> None:
         """Plot the first orbital/field and show the list of fields."""
         volfile = self._volfile
@@ -1014,7 +1431,6 @@ class MainWindow(QMainWindow):
         self._vol_list.addItems(volfile.labels)
         self._vol_list.setVisible(True)
         self._vol_list.blockSignals(False)
-        self._limit_volumetric_height()
         self._plot_volume(0)
         self._vol_list.setCurrentRow(0)
 
@@ -1056,6 +1472,359 @@ class MainWindow(QMainWindow):
         if self.isVisible():
             self.plotter.render()
 
+    # -- atomic orbitals ----------------------------------------------------
+
+    @staticmethod
+    def _ao_type_name(l: int) -> str:
+        """Spectroscopic letter for an angular momentum (0=s, 1=p, 2=d...)."""
+        return {0: "s", 1: "p", 2: "d", 3: "f", 4: "g"}.get(l, str(l))
+
+    def _on_show_ids_toggled(self, checked: bool) -> None:
+        """Tools > Show ID label: overlay the per-atom ID numbers."""
+        if self.renderer.molecule is None:
+            # Nothing to label; keep the action tidy.
+            self.renderer.set_id_labels(False)
+            if self._act_show_ids is not None and self._act_show_ids.isChecked():
+                self._act_show_ids.blockSignals(True)
+                self._act_show_ids.setChecked(False)
+                self._act_show_ids.blockSignals(False)
+            return
+        self.renderer.set_id_labels(bool(checked))
+        if self.isVisible():
+            self.plotter.render()
+
+    def _on_visualize_ao_toggled(self, checked: bool) -> None:
+        """Tools > Visualize atomic orbitals: swap the volumetric panel page."""
+        if checked:
+            self._enter_ao_mode()
+            self.statusBar().showMessage(
+                "Atomic orbitals: pick an atom and a basis function, then Plot."
+            )
+        else:
+            self._exit_ao_mode()
+            self.statusBar().showMessage(self._file_status or "Ready.")
+
+    def _enter_ao_mode(self) -> None:
+        """Switch the volumetric panel to the atomic-orbitals page."""
+        volfile = self._volfile
+        if volfile is None or volfile.basis is None:
+            # The action is disabled in this case; keep the check state tidy.
+            if self._act_visualize_ao is not None and self._act_visualize_ao.isChecked():
+                self._act_visualize_ao.blockSignals(True)
+                self._act_visualize_ao.setChecked(False)
+                self._act_visualize_ao.blockSignals(False)
+            return
+        self._reset_ao_session()
+        self._vol_box.setTitle("Volumetric: AO")
+        self._populate_ao_controls()
+        self._vol_stack.setCurrentWidget(self._ao_page)
+
+    def _reset_ao_session(self) -> None:
+        """Put the atomic-orbital pickers back to a fresh, empty session.
+
+        Nothing is plotted, the Isovalue/Quality rows are hidden, the first
+        "Plot AO" button is ready and the second-AO picker (and its offer) is
+        tucked away. It runs when entering AO mode and again when leaving it,
+        so the second AO can never stay "open" across a switch to the MO page
+        (which would swallow the "Plot another AO" button on return).
+        """
+        self._ao_plotted = False
+        self._ao_manual_iso = False
+        self._ao_cache = {}
+        self._ao2_plotted = False
+        if not hasattr(self, "_ao_plot_another_btn"):
+            return
+        self._ao_iso_row.setVisible(False)
+        self._ao_qual_row.setVisible(False)
+        self._ao_plot_btn.setVisible(True)
+        self._ao_plot_another_btn.setVisible(False)
+        self._ao2_box.setVisible(False)
+        self._ao2_plot_btn.setVisible(True)
+
+    def _exit_ao_mode(self) -> None:
+        """Return to the MO page and reset the atomic-orbital session."""
+        if hasattr(self, "_vol_stack") and hasattr(self, "_mo_page"):
+            self._vol_stack.setCurrentWidget(self._mo_page)
+            self._vol_box.setTitle("Volumetric: MO")
+        # Leaving AO mode clears both pickers: re-entering is always a clean
+        # session, so after replotting the first AO the "Plot another AO"
+        # offer is there again.
+        if hasattr(self, "_ao_plot_another_btn"):
+            self._reset_ao_session()
+
+    def _populate_ao_controls(self) -> None:
+        """Fill the Atom combo and select the first atom (and its orbitals)."""
+        volfile = self._volfile
+        if volfile is None or volfile.basis is None:
+            return
+        # Adding the first item auto-selects it (emitting currentIndexChanged);
+        # block signals so the selection below is the one that drives the
+        # Type/Orbital population.
+        self._ao_atom_combo.blockSignals(True)
+        self._ao_atom_combo.clear()
+        for i, symbol in enumerate(volfile.molecule.symbols):
+            self._ao_atom_combo.addItem(f"{i + 1} · {symbol}", i)
+        self._ao_atom_combo.blockSignals(False)
+        if self._ao_atom_combo.count():
+            # Populate Type/Orbital for the (silently selected) first atom.
+            self._on_ao_atom_changed()
+
+    def _on_ao_atom_changed(self) -> None:
+        """An atom was chosen: rebuild its Type/Orbital lists and re-plot."""
+        if self._ao_filling:
+            return
+        volfile = self._volfile
+        if volfile is None or volfile.basis is None:
+            return
+        atom = self._ao_atom_combo.currentData()
+        if atom is None:
+            return
+        groups = atomic_orbitals_for_atom(volfile.basis, atom)
+        self._ao_filling = True
+        self._ao_type_combo.clear()
+        for l, _aos in groups.items():
+            self._ao_type_combo.addItem(self._ao_type_name(l), l)
+        self._ao_filling = False
+        self._populate_ao_orbital_list()
+        self._maybe_ao_replot()
+
+    def _on_ao_type_changed(self) -> None:
+        """A type was chosen: rebuild the Orbital list and re-plot."""
+        if self._ao_filling:
+            return
+        self._populate_ao_orbital_list()
+        self._maybe_ao_replot()
+
+    def _on_ao_orbital_changed(self) -> None:
+        if not self._ao_filling:
+            self._maybe_ao_replot()
+
+    def _populate_ao_orbital_list(self) -> None:
+        """Fill the Orbital combo with the basis functions of the current type."""
+        volfile = self._volfile
+        if volfile is None or volfile.basis is None:
+            return
+        atom = self._ao_atom_combo.currentData()
+        l = self._ao_type_combo.currentData()
+        if atom is None or l is None:
+            return
+        aos = atomic_orbitals_for_atom(volfile.basis, atom).get(l, [])
+        self._ao_filling = True
+        self._ao_orb_combo.clear()
+        for ordinal, ao in enumerate(aos, start=1):
+            text = atomic_orbital_label(ao)
+            if len(aos) > 1:
+                text = f"{text}  #{ordinal}"
+            self._ao_orb_combo.addItem(text, ao)
+        self._ao_filling = False
+        if self._ao_orb_combo.count():
+            self._ao_orb_combo.setCurrentIndex(0)
+
+    def _maybe_ao_replot(self) -> None:
+        """Re-plot after a selection change once a first plot exists."""
+        if self._ao_plotted:
+            self._plot_current_ao()
+
+    def _on_plot_atomic_orbital(self) -> None:
+        self._plot_current_ao()
+
+    def _on_ao_iso_changed(self, _value: float) -> None:
+        self._ao_manual_iso = True
+        if self._ao_plotted:
+            self._render_ao_scene()
+
+    def _on_ao_quality_changed(self, _text: str) -> None:
+        if self._ao_plotted:
+            self._render_ao_scene()
+
+    def _plot_current_ao(self) -> None:
+        """Start/refresh the first atomic orbital and render the AO scene."""
+        if self._volfile is None or self._volfile.basis is None:
+            return
+        ao = self._ao_orb_combo.currentData()
+        if ao is None:
+            return
+        if not self._ao_plotted:
+            # First plot: reveal the Isovalue/Quality controls, hide this Plot
+            # button (selection changes re-plot from now on) and offer adding
+            # a second atomic orbital (never more than two on screen).
+            self._ao_plotted = True
+            self._ao_iso_row.setVisible(True)
+            self._ao_qual_row.setVisible(True)
+            self._ao_plot_btn.setVisible(False)
+            self._refresh_ao2_offer()
+            if not self._ao_manual_iso:
+                volume = self._ao_volume(ao)
+                if volume is not None:
+                    # Suggest a level that shows the surface without filling
+                    # the box (the user can override it: manual isovalue).
+                    suggested = volume.suggest_isovalue()
+                    self._ao_iso_spin.blockSignals(True)
+                    self._ao_iso_spin.setValue(suggested)
+                    self._ao_iso_spin.blockSignals(False)
+        self._render_ao_scene()
+
+    def _ao_volume(self, ao) -> VolumeData | None:
+        """Return the cached (or newly computed) grid of an atomic orbital."""
+        volfile = self._volfile
+        if ao is None or volfile is None or volfile.basis is None:
+            return None
+        volume = self._ao_cache.get(ao.index)
+        if volume is None:
+            try:
+                volume = evaluate_atomic_orbital(volfile.basis, ao)
+            except Exception as exc:  # noqa: BLE001 - errors to the UI
+                QMessageBox.critical(
+                    self, "Error computing atomic orbital", str(exc)
+                )
+                return None
+            self._ao_cache[ao.index] = volume
+        return volume
+
+    def _render_ao_scene(self) -> None:
+        """(Re)render the plotted atomic orbitals: AO1 plus AO2 when plotted.
+
+        Both orbitals share the Isovalue/Quality rows and are added as
+        separate overlays, so changing either one redraws the whole pair.
+        """
+        if self._volfile is None or self._volfile.basis is None:
+            return
+        level = self._ao_iso_spin.value()
+        quality = self._ao_quality_combo.currentText().lower()
+        level = level if level > 0 else None
+        self.vol_renderer.clear()
+        shown: list[str] = []
+        if self._ao_plotted:
+            ao1 = self._ao_orb_combo.currentData()
+            if ao1 is not None:
+                volume = self._ao_volume(ao1)
+                if volume is not None:
+                    self.vol_renderer.add(
+                        volume, level=level, quality=quality, name="ao-1"
+                    )
+                    shown.append(self._ao_orb_combo.currentText())
+        if getattr(self, "_ao2_plotted", False):
+            ao2 = self._ao2_orb_combo.currentData()
+            if ao2 is not None:
+                volume = self._ao_volume(ao2)
+                if volume is not None:
+                    self.vol_renderer.add(
+                        volume, level=level, quality=quality, name="ao-2"
+                    )
+                    shown.append(self._ao2_orb_combo.currentText())
+        if shown:
+            self.statusBar().showMessage("Isosurfaces: " + " · ".join(shown))
+        self._refresh_ao2_offer()
+        if self.isVisible():
+            self.plotter.render()
+
+    def _refresh_ao2_offer(self) -> None:
+        """Keep the 'Plot another AO' offer consistent with the state.
+
+        The button is visible whenever the first AO is on screen and the
+        second picker has not been revealed yet; it disappears as soon as the
+        second picker is shown (at most two AOs). Recomputing it from the
+        state (instead of only on the first plot) restores it after replots
+        and after round trips through the MO page.
+        """
+        if not hasattr(self, "_ao_plot_another_btn"):
+            return
+        self._ao_plot_another_btn.setVisible(
+            self._ao_plotted and self._ao2_box.isHidden()
+        )
+
+    # -- second atomic orbital (at most two at once) -----------------------
+
+    def _on_plot_another_ao(self) -> None:
+        """Reveal the second atomic-orbital picker (never a third one)."""
+        box = getattr(self, "_ao2_box", None)
+        if box is None or not box.isHidden():
+            return
+        self._ao2_plot_btn.setVisible(True)
+        box.setVisible(True)
+        self._ao_plot_another_btn.setVisible(False)
+        self._populate_ao2_controls()
+
+    def _populate_ao2_controls(self) -> None:
+        """Fill the second AO's Atom combo and select the first atom."""
+        volfile = self._volfile
+        if volfile is None or volfile.basis is None:
+            return
+        self._ao2_atom_combo.blockSignals(True)
+        self._ao2_atom_combo.clear()
+        for i, symbol in enumerate(volfile.molecule.symbols):
+            self._ao2_atom_combo.addItem(f"{i + 1} · {symbol}", i)
+        self._ao2_atom_combo.blockSignals(False)
+        if self._ao2_atom_combo.count():
+            self._on_ao2_atom_changed()
+
+    def _on_ao2_atom_changed(self) -> None:
+        """An atom was chosen for the second AO: rebuild its Type/Orbital."""
+        if self._ao_filling:
+            return
+        volfile = self._volfile
+        if volfile is None or volfile.basis is None:
+            return
+        atom = self._ao2_atom_combo.currentData()
+        if atom is None:
+            return
+        groups = atomic_orbitals_for_atom(volfile.basis, atom)
+        self._ao_filling = True
+        self._ao2_type_combo.clear()
+        for l, _aos in groups.items():
+            self._ao2_type_combo.addItem(self._ao_type_name(l), l)
+        self._ao_filling = False
+        self._populate_ao2_orbital_list()
+        self._maybe_ao2_replot()
+
+    def _on_ao2_type_changed(self) -> None:
+        if self._ao_filling:
+            return
+        self._populate_ao2_orbital_list()
+        self._maybe_ao2_replot()
+
+    def _on_ao2_orbital_changed(self) -> None:
+        if not self._ao_filling:
+            self._maybe_ao2_replot()
+
+    def _populate_ao2_orbital_list(self) -> None:
+        """Fill the second AO's Orbital combo for the current atom/type."""
+        volfile = self._volfile
+        if volfile is None or volfile.basis is None:
+            return
+        atom = self._ao2_atom_combo.currentData()
+        l = self._ao2_type_combo.currentData()
+        if atom is None or l is None:
+            return
+        aos = atomic_orbitals_for_atom(volfile.basis, atom).get(l, [])
+        self._ao_filling = True
+        self._ao2_orb_combo.clear()
+        for ordinal, ao in enumerate(aos, start=1):
+            text = atomic_orbital_label(ao)
+            if len(aos) > 1:
+                text = f"{text}  #{ordinal}"
+            self._ao2_orb_combo.addItem(text, ao)
+        self._ao_filling = False
+        if self._ao2_orb_combo.count():
+            self._ao2_orb_combo.setCurrentIndex(0)
+
+    def _maybe_ao2_replot(self) -> None:
+        """Re-plot the pair after a second-AO change once it is on screen."""
+        if getattr(self, "_ao2_plotted", False):
+            self._render_ao_scene()
+
+    def _on_plot_ao2(self) -> None:
+        """Plot the second atomic orbital (it joins the first on screen)."""
+        if self._volfile is None or self._volfile.basis is None:
+            return
+        ao2 = self._ao2_orb_combo.currentData()
+        if ao2 is None:
+            return
+        if not self._ao2_plotted:
+            self._ao2_plotted = True
+            self._ao2_plot_btn.setVisible(False)
+        self._render_ao_scene()
+
     def export_image(self) -> None:
         if self._molecule is None:
             QMessageBox.information(self, "Export", "Load a structure first.")
@@ -1095,7 +1864,7 @@ class MainWindow(QMainWindow):
         dialog.setIcon(QMessageBox.Icon.Information)
         dialog.setWindowTitle("About PyChem")
         dialog.setText(
-            "PyChem 0.1.0\n\n"
+            f"PyChem {PYCHEN_VERSION}\n\n"
             "Modular molecular visualization tool in Python.\n"
             "PySide6 + PyVista + RDKit."
         )

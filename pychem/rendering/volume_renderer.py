@@ -69,6 +69,21 @@ class VolumeRenderer:
         so its facets are rounded; Medium keeps the raw contour.
         """
         self.clear()
+        self.add(volume, level=level, quality=quality, name="isosurface")
+
+    def add(
+        self,
+        volume: VolumeData,
+        level: float | None = None,
+        quality: str = "medium",
+        name: str = "isosurface",
+    ) -> None:
+        """Add the isosurface of ``volume`` without clearing the scene.
+
+        This is used to show several fields/orbitals at once (e.g. two atomic
+        orbitals); every call contributes its own positive/negative pair of
+        actors, so ``name`` must differ between concurrent volumes.
+        """
         max_abs = volume.max_abs
         if max_abs <= 0.0:
             return
@@ -94,7 +109,7 @@ class VolumeRenderer:
                     color=_POS_COLOR,
                     opacity=_OPACITY,
                     smooth_shading=True,
-                    name="isosurface-positive",
+                    name=f"{name}-positive",
                     reset_camera=False,
                 )
             )
@@ -106,7 +121,7 @@ class VolumeRenderer:
                     color=_NEG_COLOR,
                     opacity=_OPACITY,
                     smooth_shading=True,
-                    name="isosurface-negative",
+                    name=f"{name}-negative",
                     reset_camera=False,
                 )
             )
