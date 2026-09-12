@@ -43,8 +43,8 @@ Done:
   shown as usual and the side panel offers a **"Plot isosurface"** button;
   plotting shows the field and a list of the orbitals/fields, each selectable
   with a click. Isosurface settings: **absolute isovalue** (auto-suggested on
-  first plot, editable), **quality** (Low/Medium/High), and the Volumetric
-  section is kept to about half of the panel area.
+  first plot, editable), **quality** (Medium/High), and the list of
+  fields/orbitals.
 - **Measurements**: a side-panel section with three exclusive modes — Bonds,
   Angles and Dihedrals. Pick 2/3/4 atoms (left-click) and the value appears as
   an anchored, always-readable label in the 3D viewer near the measured atoms;
@@ -72,6 +72,22 @@ Done:
   pose) and volumetric/orbital isosurfaces. The numbers use the same green as
   the side-panel titles (`#87D68D`), falling back to **black** on very light
   atoms (e.g. white hydrogen) so they stay readable.
+- **Electrostatic-potential (ESP) maps**: a checkable **Tools → Visualize
+  Electrostatic Potential** entry, enabled only once a structure is on screen.
+  It opens a file dialog that picks the **two cubes of that structure at
+  once** — the electron density and the electrostatic potential — and draws a
+  **semi-transparent isosurface of the density envelope** (ρ ≈ 1e-3 e/Bohr³)
+  coloured with the potential sampled on it, through a diverging **colormap**
+  (red = lower potential, electron-rich; blue = higher, electron-poor) and a
+  colour bar showing the value range in a.u. The selection order does not
+  matter: the two files are told apart by the **second line** of each cube,
+  which states what it holds (`Total electron density` /
+  `Electrostatic Potential`). Both cubes are written by **`orca_plot`** from
+  the same `.gbw` file (`orca_plot job.gbw -i`, electron density and
+  electrostatic potential, Gaussian-cube format); `orca_plot` is what records
+  that second line, which is why the entry reminds you of it while you pick
+  the files (its tooltip carries the full recipe). The ESP map and the
+  orbital/AO isosurfaces are alternatives: showing one clears the other.
 - **PySide6 GUI** (`pychem/app/`): open a structure, export a PNG image,
   reset the camera, a fixed side panel with atom properties and trajectory
   controls, status bar.
@@ -88,11 +104,12 @@ Done:
   Modes: GUI (default), *offscreen* render (`--screenshot`) and text summary
   (`--info`). With no file argument the GUI opens empty — use File > Open
   structure... to load a file.
-- Tests with pytest (69 tests).
+- Tests with pytest (90 tests).
 
 In progress / next:
 
 - More formats (Cube refinements, Molden with d/f shells, analysis of quantum-mechanical outputs...).
+- ESP map refinements (user-selectable isovalue/colormap range, slice planes).
 
 ## Layout
 

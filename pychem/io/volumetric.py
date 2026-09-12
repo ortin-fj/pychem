@@ -16,7 +16,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 import numpy as np
 
@@ -118,7 +118,15 @@ def read_cube(path: str | Path) -> tuple[Molecule, list[VolumeData]]:
     volumes: list[VolumeData] = []
     for block in range(n_blocks):
         raw = raw_all[block * n_values : (block + 1) * n_values]
-        values = raw.reshape(tuple(dims), order="F")  # x fastest in cube files
+        # Voxel ordering (regression fix). The values are stored with the LAST
+        # grid axis varying fastest (x outermost), so an (nx, ny, nz) array
+        # indexed as values[i, j, k] = value at (x_i, y_j, z_k) must be built
+        # with a C-order reshape. Verified against the physics of the sample
+        # cubes: with the previous F-order ("first axis fastest") reshape the
+        # field came out transposed, and the density peaked *between* atoms
+        # (rho(Br) = 0.003 instead of 96.4, its true maximum). The transposition
+        # sheared and shifted every isosurface away from the molecule.
+        values = raw.reshape(tuple(dims), order="C")
         label = comment2 or "MO 1"
         if n_blocks > 1:
             label = f"{label} ({block + 1})" if block else comment2 or "MO 1"
@@ -132,6 +140,87 @@ def read_cube(path: str | Path) -> tuple[Molecule, list[VolumeData]]:
             )
         )
     return molecule, volumes
+
+
+# ---------------------------------------------------------------------------
+# Electrostatic-potential maps (electron density + potential cube pair)
+# ---------------------------------------------------------------------------
+
+# Descriptive names that the cube generators write on the *second line* (the
+# comment line). PyChem reads that line to tell the two cubes of an ESP map
+# apart, which is why the Tools menu asks the user to generate the files so
+# that the line states their contents.
+DENSITY_LABEL = "Total electron density"
+POTENTIAL_LABEL = "Electrostatic Potential"
+
+_DENSITY_MARKERS = ("electron density", "eldens")
+_POTENTIAL_MARKERS = ("electrostatic potential", "esp")
+
+
+def cube_kind(label: str) -> str:
+    """Classify a cube's second-line description.
+
+    Returns ``"density"`` for an electron-density cube, ``"potential"`` for an
+    electrostatic-potential cube and ``"unknown"`` otherwise.
+    """
+    text = (label or "").strip().lower()
+    if not text:
+        return "unknown"
+    if any(marker in text for marker in _POTENTIAL_MARKERS):
+        return "potential"
+    if any(marker in text for marker in _DENSITY_MARKERS):
+        return "density"
+    return "unknown"
+
+
+@dataclass(frozen=True)
+class EspPair:
+    """The two fields an electrostatic-potential map is built from.
+
+    Both grids describe the same structure: the density gives the surface
+    (its envelope) and the potential gives the values painted on it.
+    """
+
+    density: VolumeData
+    potential: VolumeData
+    density_path: Path
+    potential_path: Path
+
+
+def read_esp_pair(paths: Sequence[str | Path]) -> EspPair:
+    """Pick the density and the potential cube out of ``paths``.
+
+    The roles are read from each cube's second line (see :func:`cube_kind`),
+    so the order in which the files were selected does not matter. Raises
+    :class:`ValueError` when the pair cannot be identified, quoting what each
+    selected file declares.
+    """
+    loaded: list[tuple[Path, VolumeData]] = []
+    for raw in paths:
+        p = Path(raw)
+        _molecule, volumes = read_cube(p)
+        if not volumes:
+            raise ValueError(f"{p.name} contains no scalar field")
+        loaded.append((p, volumes[0]))
+
+    densities = [(p, v) for p, v in loaded if cube_kind(v.label) == "density"]
+    potentials = [(p, v) for p, v in loaded if cube_kind(v.label) == "potential"]
+    if not densities or not potentials:
+        found = ", ".join(f"{p.name} -> {v.label!r}" for p, v in loaded) or "none"
+        raise ValueError(
+            "An electrostatic-potential map needs both an electron-density "
+            f"and a potential cube (second lines {DENSITY_LABEL!r} and "
+            f"{POTENTIAL_LABEL!r}); selected: {found}"
+        )
+
+    density_path, density = densities[0]
+    potential_path, potential = potentials[0]
+    return EspPair(
+        density=density,
+        potential=potential,
+        density_path=density_path,
+        potential_path=potential_path,
+    )
 
 
 # ---------------------------------------------------------------------------

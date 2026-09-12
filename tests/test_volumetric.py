@@ -5,11 +5,18 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from pychem.io.volumetric import load_volume_file, read_cube
+from pychem.io.volumetric import (
+    cube_kind,
+    load_volume_file,
+    read_cube,
+    read_esp_pair,
+)
 
 DATA = Path(__file__).parent / "data" / "volumetric"
 CUBE = DATA / "single_point.mo1a.cube"
 MOLDEN = DATA / "single_point.molden"
+DENSITY_CUBE = DATA / "opt.eldens.cube"
+ESP_CUBE = DATA / "0.esp.cube"
 
 
 def test_read_cube_molecule_and_grid():
@@ -62,6 +69,45 @@ def test_load_molden_metadata_and_evaluate():
     vol = vf.volume(30)  # evaluate one orbital on the grid
     assert vol.shape == (40, 40, 40)
     assert vol.max_abs > 0
+
+
+def test_read_cube_field_is_anchored_to_the_nuclei():
+    """Regression: the voxel field must not read as a transposed grid.
+
+    The values are stored with the *last* grid axis varying fastest, so
+    reshaping in F order ("first axis fastest") transposes the field: the
+    density then peaks *between* atoms (rho(Br) dropped to 0.003 instead of
+    being the grid maximum) and every isosurface came out sheared and shifted
+    away from the molecule.
+    """
+    molecule, volumes = read_cube(DENSITY_CUBE)
+    density = volumes[0]
+
+    at_atoms = density.sample_at(molecule.coords)
+    rho = dict(zip(molecule.symbols, at_atoms))
+    # An electron density decreases with the nuclear charge.
+    assert rho["Br"] > rho["Cl"] > rho["C"] > 5.0 * rho["H"]
+
+    # Its global maximum is a heavy nucleus too (within one voxel of it).
+    heavy = molecule.symbols.index("Br")
+    node = np.unravel_index(np.argmax(density.values), density.shape)
+    node_position = density.origin + np.asarray(node) * density.spacing
+    distance = float(np.linalg.norm(node_position - molecule.coords[heavy]))
+    assert distance < float(np.linalg.norm(density.spacing))
+
+
+def test_read_cube_potential_field_uses_the_same_order():
+    """The ESP cube shares the axis order (its divergence sits on Br)."""
+    molecule, volumes = read_cube(ESP_CUBE)
+    potential = volumes[0]
+
+    heavy = molecule.symbols.index("Br")
+    node = np.unravel_index(np.argmax(potential.values), potential.shape)
+    node_position = potential.origin + np.asarray(node) * potential.spacing
+    distance = float(np.linalg.norm(node_position - molecule.coords[heavy]))
+    assert distance < float(np.linalg.norm(potential.spacing))
+    # Nuclear attraction: the potential is huge (and positive) at the nucleus.
+    assert potential.values.max() > 10.0
 
 
 def test_read_cube_multiblock(tmp_path):
@@ -129,3 +175,73 @@ def test_evaluate_atomic_orbital_grid():
         assert vol.shape == (40, 40, 40)
         assert vol.max_abs > 0
         assert vol.label  # non-empty label
+
+
+# ---------------------------------------------------------------------------
+# Electrostatic-potential maps (density + potential cube pair)
+# ---------------------------------------------------------------------------
+
+
+def test_cube_kind_reads_the_second_line_description():
+    assert cube_kind("Total electron density") == "density"
+    assert cube_kind("Electrostatic Potential") == "potential"
+    assert cube_kind("Electrostatic potential (a.u.)") == "potential"
+    assert cube_kind("scf electron density") == "density"
+    assert cube_kind("MO 1") == "unknown"
+    assert cube_kind("") == "unknown"
+
+
+def test_read_esp_pair_is_order_independent():
+    """The density and the potential are told apart by their own labels."""
+    pair = read_esp_pair([ESP_CUBE, DENSITY_CUBE])
+    assert pair.density_path == DENSITY_CUBE
+    assert pair.potential_path == ESP_CUBE
+    assert pair.density.label == "Total electron density"
+    assert pair.potential.label == "Electrostatic Potential"
+
+    # Both grids describe the same box, so the potential can be sampled on
+    # the density envelope.
+    np.testing.assert_allclose(pair.density.origin, pair.potential.origin)
+    np.testing.assert_allclose(pair.density.spacing, pair.potential.spacing)
+    assert pair.density.shape == pair.potential.shape == (40, 40, 40)
+
+    swapped = read_esp_pair([DENSITY_CUBE, ESP_CUBE])
+    assert swapped.density_path == pair.density_path
+    assert swapped.potential_path == pair.potential_path
+
+
+def test_read_esp_pair_requires_both_cubes():
+    with pytest.raises(ValueError, match="Total electron density"):
+        read_esp_pair([DENSITY_CUBE, DENSITY_CUBE])
+    with pytest.raises(ValueError, match="Electrostatic Potential"):
+        read_esp_pair([ESP_CUBE])
+
+
+def test_esp_sample_data_matches_its_structure():
+    """The ESP cubes and sn2_opt.xyz are the same geometry (Å)."""
+    from pychem.io import get_reader
+
+    xyz = get_reader(Path(__file__).parent / "data" / "xyz" / "sn2_opt.xyz")
+    pair = read_esp_pair([DENSITY_CUBE, ESP_CUBE])
+    density_molecule, _ = read_cube(DENSITY_CUBE)
+
+    assert density_molecule.symbols == xyz.symbols
+    np.testing.assert_allclose(density_molecule.coords, xyz.coords, atol=1e-4)
+    np.testing.assert_allclose(
+        read_cube(ESP_CUBE)[0].coords, xyz.coords, atol=1e-4
+    )
+    assert pair.density.suggest_density_isovalue() == pytest.approx(1e-3)
+
+
+def test_potential_sampled_on_the_density_envelope():
+    """Sampling the potential inside its grid stays within its own range."""
+    pair = read_esp_pair([DENSITY_CUBE, ESP_CUBE])
+    points = pair.density.origin + pair.density.spacing * np.array(
+        [[10, 10, 10], [20, 20, 20], [30, 5, 25]]
+    )
+    values = pair.potential.sample_at(points)
+
+    assert np.all(np.isfinite(values))
+    assert values.min() >= pair.potential.values.min() - 1e-9
+    assert values.max() <= pair.potential.values.max() + 1e-9
+

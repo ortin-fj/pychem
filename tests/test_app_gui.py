@@ -14,6 +14,7 @@ import pytest  # noqa: E402
 pyside6 = pytest.importorskip("PySide6")
 
 DATA = Path(__file__).parent / "data" / "xyz"
+VOLUME_DATA = Path(__file__).parent / "data" / "volumetric"
 
 
 @pytest.fixture(scope="module")
@@ -738,6 +739,123 @@ def test_show_id_labels_follow_trajectory_and_measurement(qapp):
     qapp.processEvents()
     assert len(window.renderer._meas_actors) > 0
     assert len(window.renderer._id_label_actors) > 0
+
+    window.close()
+    qapp.processEvents()
+
+
+# ---------------------------------------------------------------------------
+# Tools > Visualize Electrostatic Potential
+# ---------------------------------------------------------------------------
+
+
+def test_esp_action_needs_a_loaded_structure(qapp):
+    from pychem.app import MainWindow
+
+    # Empty GUI: there is no structure to paint a potential around.
+    window = MainWindow()
+    qapp.processEvents()
+    assert window._act_visualize_esp is not None
+    assert not window._act_visualize_esp.isEnabled()
+    assert not window._act_visualize_esp.isChecked()
+    window.close()
+    qapp.processEvents()
+
+    window = MainWindow(filename=DATA / "sn2_opt.xyz")
+    qapp.processEvents()
+    assert window._act_visualize_esp.isEnabled()
+    assert not window._act_visualize_esp.isChecked()
+    window.close()
+    qapp.processEvents()
+
+
+def test_electrostatic_potential_flow(qapp):
+    from pychem.app import MainWindow
+
+    density = VOLUME_DATA / "opt.eldens.cube"
+    potential = VOLUME_DATA / "0.esp.cube"
+    window = MainWindow(filename=DATA / "sn2_opt.xyz")
+    qapp.processEvents()
+
+    # Loading the pair (what the file dialog ends up calling) paints the
+    # potential on the density envelope and checks the Tools action.
+    window._load_esp_cubes([potential, density])
+    qapp.processEvents()
+    assert window._act_visualize_esp.isChecked()
+    assert window._esp_pair is not None
+    assert window._esp_pair.density_path == density
+    assert window._esp_pair.potential_path == potential
+
+    # One semi-transparent actor, coloured by the potential (a real range).
+    assert len(window.esp_renderer._actors) == 1
+    surface = window.esp_renderer.surface
+    assert surface is not None and surface.n_points > 0
+    values = surface.point_data["ESP (a.u.)"]
+    assert len(values) == surface.n_points
+    assert values.min() < values.max()
+    assert "Electrostatic potential" in window.statusBar().currentMessage()
+
+    # Unchecking the entry drops the overlay and forgets the pair, so the
+    # cubes are asked for again the next time.
+    window._act_visualize_esp.trigger()
+    qapp.processEvents()
+    assert not window._act_visualize_esp.isChecked()
+    assert window.esp_renderer._actors == []
+    assert window._esp_pair is None
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_esp_requires_both_cubes(qapp):
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=DATA / "sn2_opt.xyz")
+    qapp.processEvents()
+
+    # Two densities: the potential is missing, so nothing is drawn.
+    with pytest.raises(ValueError, match="Electrostatic Potential"):
+        window._load_esp_cubes([VOLUME_DATA / "opt.eldens.cube"] * 2)
+    assert window._esp_pair is None
+    assert window.esp_renderer._actors == []
+    assert not window._act_visualize_esp.isChecked()
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_esp_and_orbital_isosurfaces_are_alternatives(qapp):
+    """The ESP map and the MO/AO isosurfaces never show at the same time."""
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=VOLUME_DATA / "single_point.molden")
+    qapp.processEvents()
+
+    # Plot an atomic orbital: the Volumetric panel moves to the AO page.
+    window._act_visualize_ao.trigger()
+    window._on_plot_atomic_orbital()
+    qapp.processEvents()
+    assert window._vol_stack.currentWidget() is window._ao_page
+    assert len(window.vol_renderer._actors) >= 1
+
+    # Showing the ESP map leaves AO mode and clears the orbital isosurface.
+    window._load_esp_cubes(
+        [VOLUME_DATA / "0.esp.cube", VOLUME_DATA / "opt.eldens.cube"]
+    )
+    qapp.processEvents()
+    assert not window._act_visualize_ao.isChecked()
+    assert window._vol_stack.currentWidget() is window._mo_page
+    assert window._vol_box.title() == "Volumetric: MO"
+    assert window.vol_renderer._actors == []
+    assert len(window.esp_renderer._actors) == 1
+
+    # Plotting an orbital (a molecular one here) drops the ESP map again.
+    window._on_plot_isosurface()
+    qapp.processEvents()
+    assert window.esp_renderer._actors == []
+    assert window._esp_pair is None
+    assert not window._act_visualize_esp.isChecked()
+    assert len(window.vol_renderer._actors) >= 1
 
     window.close()
     qapp.processEvents()

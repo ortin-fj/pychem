@@ -13,6 +13,8 @@ the selected atom, a trajectory playback bar and isosurfaces.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import math
 import time
 from pathlib import Path
@@ -54,17 +56,47 @@ from pychem.core.trajectory import Trajectory
 from pychem.core.volume import VolumeData
 from pychem.io import get_reader
 from pychem.io.volumetric import (
+    DENSITY_LABEL,
+    POTENTIAL_LABEL,
+    EspPair,
     VolumetricFile,
     atomic_orbital_label,
     atomic_orbitals_for_atom,
     evaluate_atomic_orbital,
     load_volume_file,
+    read_esp_pair,
 )
 from pychem.rendering import MolecularRenderer, RenderOptions
+from pychem.rendering.esp_renderer import ElectrostaticRenderer
 from pychem.rendering.volume_renderer import VolumeRenderer
 
 # Extensions accepted by the "Open" dialog. Extended as formats are added.
 _OPEN_FILTER = "Structures (*.xyz *.pdb);;All files (*)"
+
+# Tools > Visualize Electrostatic Potential. An ESP map is built from the
+# electron-density and the electrostatic-potential cubes of the same
+# structure, so both are picked at once and told apart by the cube's second
+# line (see pychem/io/volumetric.py). The action tooltip carries the full
+# method to generate the files; the (short) status hint and the error dialog
+# repeat the essentials.
+_ESP_FILTER = "Cube files (*.cube);;All files (*)"
+_ESP_CAPTION = (
+    "Select the 2 cubes written by orca_plot "
+    f"({DENSITY_LABEL!r} + {POTENTIAL_LABEL!r})"
+)
+_ESP_STATUS = (
+    "Select the density and potential cubes written by orca_plot for this "
+    "structure (order does not matter)."
+)
+_ESP_METHOD = (
+    "Paint the electrostatic potential on the electron-density envelope.\n"
+    "An ESP map needs two Gaussian cubes of the same structure, both written "
+    "by orca_plot from the same .gbw file (orca_plot job.gbw -i): the electron "
+    "density and the electrostatic potential. orca_plot records the contents on "
+    "the second line of each cube ("
+    f"{DENSITY_LABEL!r} and {POTENTIAL_LABEL!r}); PyChem reads that line to "
+    "tell the two files apart, so the selection order does not matter."
+)
 
 # Trajectory playback tuning.
 _PLAYBACK_UPDATE_MS = 16  # refresh of the playback timer (~60 Hz)
@@ -348,6 +380,10 @@ class MainWindow(QMainWindow):
         self._ao_manual_iso = False
         self._ao_filling = False
         self._ao2_plotted = False
+        # Electrostatic-potential map (Tools > Visualize Electrostatic
+        # Potential): the loaded density/potential cube pair.
+        self._act_visualize_esp = None
+        self._esp_pair: EspPair | None = None
         self._meas_mode: str | None = None
         self._meas_atoms: list[int] = []
         self._meas_buttons: dict[str, QPushButton] = {}
@@ -377,6 +413,7 @@ class MainWindow(QMainWindow):
         self.plotter = QtInteractor(frame)
         self.renderer = MolecularRenderer(self.plotter, RenderOptions())
         self.vol_renderer = VolumeRenderer(self.plotter)
+        self.esp_renderer = ElectrostaticRenderer(self.plotter)
         layout.addWidget(self.plotter.interactor)
         self.setCentralWidget(frame)
 
@@ -584,6 +621,16 @@ class MainWindow(QMainWindow):
         act_ao.triggered.connect(self._on_visualize_ao_toggled)
         self._act_visualize_ao = act_ao
 
+        act_esp = tools_menu.addAction("Visualize &Electrostatic Potential")
+        # Needs a structure on screen to paint the potential around.
+        act_esp.setCheckable(True)
+        act_esp.setEnabled(False)
+        # The tooltip tells the user how to generate the two cubes.
+        act_esp.setToolTip(_ESP_METHOD)
+        act_esp.triggered.connect(self._on_visualize_esp_toggled)
+        self._act_visualize_esp = act_esp
+        tools_menu.setToolTipsVisible(True)
+
         act_ids = tools_menu.addAction("&Show ID label")
         # Overlays the atom number on every atom; works for any molecule on
         # screen (plain structures, trajectories and volumetric files).
@@ -631,6 +678,7 @@ class MainWindow(QMainWindow):
 
         self._set_playing(False)
         self.vol_renderer.clear()
+        self._deactivate_esp()
         self._volume_cache = {}
         self._plotted_index = None
         self._iso_manual = False
@@ -686,6 +734,9 @@ class MainWindow(QMainWindow):
                 self._act_show_ids.setChecked(False)
                 self._act_show_ids.blockSignals(False)
                 self.renderer.set_id_labels(False)
+        # "Visualize Electrostatic Potential" also needs a structure on screen.
+        if self._act_visualize_esp is not None:
+            self._act_visualize_esp.setEnabled(molecule is not None)
         self._stabilize_panel_width()
 
         if trajectory is not None:
@@ -1443,6 +1494,8 @@ class MainWindow(QMainWindow):
         volfile = self._volfile
         if volfile is None:
             return
+        # An orbital isosurface replaces a previously shown ESP map.
+        self._deactivate_esp()
         volume = self._volume_cache.get(index)
         if volume is None:
             try:
@@ -1514,6 +1567,8 @@ class MainWindow(QMainWindow):
                 self._act_visualize_ao.setChecked(False)
                 self._act_visualize_ao.blockSignals(False)
             return
+        # Atomic orbitals replace a previously shown ESP map.
+        self._deactivate_esp()
         self._reset_ao_session()
         self._vol_box.setTitle("Volumetric: AO")
         self._populate_ao_controls()
@@ -1824,6 +1879,126 @@ class MainWindow(QMainWindow):
             self._ao2_plotted = True
             self._ao2_plot_btn.setVisible(False)
         self._render_ao_scene()
+
+    # -- electrostatic potential ---------------------------------------------
+
+    def _on_visualize_esp_toggled(self, checked: bool) -> None:
+        """Tools > Visualize Electrostatic Potential.
+
+        Checking it asks for the density and potential cubes (once — the pair
+        is then reused) and paints the potential on the density envelope;
+        unchecking it drops the overlay.
+        """
+        if not checked:
+            # Forget the pair as well: next time the cubes are asked for
+            # again, so the user can pick a different map.
+            self._clear_esp_overlay()
+            self.statusBar().showMessage(self._file_status or "Ready.")
+            return
+        if self.renderer.molecule is None:
+            self._uncheck_esp_action()
+            return
+        if self._esp_pair is None and not self._choose_esp_cubes():
+            self._uncheck_esp_action()
+            return
+        self._draw_esp()
+
+    def _replace_volumetric_overlays(self) -> None:
+        """Leave MO/AO isosurfaces so the ESP map is the only volume shown."""
+        self.vol_renderer.clear()
+        if self._act_visualize_ao is not None and self._act_visualize_ao.isChecked():
+            # setChecked does not emit ``triggered``, so leave the AO mode
+            # explicitly instead of relying on its handler.
+            self._act_visualize_ao.blockSignals(True)
+            self._act_visualize_ao.setChecked(False)
+            self._act_visualize_ao.blockSignals(False)
+            self._exit_ao_mode()
+
+    def _uncheck_esp_action(self) -> None:
+        """Uncheck the Tools action without running its handler again."""
+        if self._act_visualize_esp is None:
+            return
+        self._act_visualize_esp.blockSignals(True)
+        self._act_visualize_esp.setChecked(False)
+        self._act_visualize_esp.blockSignals(False)
+
+    def _deactivate_esp(self) -> None:
+        """Uncheck the ESP action and drop its overlay (no dialog)."""
+        self._uncheck_esp_action()
+        self._clear_esp_overlay()
+
+    def _clear_esp_overlay(self) -> None:
+        """Remove the ESP surface/scalar bar and forget the cube pair."""
+        self._esp_pair = None
+        if not hasattr(self, "esp_renderer"):
+            return
+        self.esp_renderer.clear()
+        if self.isVisible():
+            self.plotter.render()
+
+    def _choose_esp_cubes(self) -> bool:
+        """Ask for the two cubes and load them; ``True`` when drawn."""
+        dialog = QFileDialog(self, _ESP_CAPTION)
+        # ExistingFiles enables selecting the density and the potential at once.
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        dialog.setNameFilter(_ESP_FILTER)
+        dialog.setLabelText(QFileDialog.DialogLabel.Accept, "Load ESP map")
+        self.statusBar().showMessage(_ESP_STATUS)
+        if dialog.exec() != QFileDialog.DialogCode.Accepted:
+            self.statusBar().showMessage(self._file_status or "Ready.")
+            return False
+        try:
+            self._load_esp_cubes(dialog.selectedFiles())
+        except Exception as exc:  # noqa: BLE001 - reader errors to the UI
+            QMessageBox.critical(
+                self, "Error loading ESP cubes", f"{exc}\n\n{_ESP_METHOD}"
+            )
+            return False
+        return True
+
+    def _load_esp_cubes(self, paths: Sequence[str | Path]) -> None:
+        """Load the density/potential pair and draw the ESP map.
+
+        This is the single entry point for showing an ESP map (the file dialog
+        goes through it), so the overlay bookkeeping — replacing the MO/AO
+        isosurfaces, keeping the Tools action in sync — happens here. Kept
+        separate from the dialog so it can be driven directly by tests.
+        """
+        pair = read_esp_pair(paths)
+        level = pair.density.suggest_density_isovalue()
+        if not self.esp_renderer.show(pair.density, pair.potential, level=level):
+            raise ValueError(
+                "The density cube has no surface at its envelope level "
+                f"({level:g}); it may be empty or stored on a different scale."
+            )
+        self._esp_pair = pair
+        # Only once the map is on screen: an ESP map and an orbital isosurface
+        # are alternative volumetric overlays.
+        self._replace_volumetric_overlays()
+        if (
+            self._act_visualize_esp is not None
+            and not self._act_visualize_esp.isChecked()
+        ):
+            self._act_visualize_esp.blockSignals(True)
+            self._act_visualize_esp.setChecked(True)
+            self._act_visualize_esp.blockSignals(False)
+        self._draw_esp()
+
+    def _draw_esp(self) -> None:
+        """Report the loaded map (including its colour range) and refresh."""
+        pair = self._esp_pair
+        if pair is None:
+            return
+        text = (
+            "Electrostatic potential on the density envelope "
+            f"({Path(pair.density_path).name} + {Path(pair.potential_path).name})"
+        )
+        clim = self.esp_renderer.clim
+        if clim is not None:
+            text += f" · {clim[0]:+.3f} … {clim[1]:+.3f} a.u."
+        self.statusBar().showMessage(text)
+        if self.isVisible():
+            self.plotter.render()
 
     def export_image(self) -> None:
         if self._molecule is None:

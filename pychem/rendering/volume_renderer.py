@@ -29,7 +29,8 @@ _HIGH_SUBDIVIDE_NSUB_LARGE = 1
 _HIGH_SUBDIVIDE_POINT_LIMIT = 20_000
 
 
-def _to_image_data(volume: VolumeData) -> pv.ImageData:
+def to_image_data(volume: VolumeData) -> pv.ImageData:
+    """Wrap a :class:`VolumeData` as a VTK ``ImageData`` (orthogonal grid)."""
     nx, ny, nz = volume.shape
     grid = pv.ImageData(
         dimensions=(nx, ny, nz),
@@ -39,6 +40,34 @@ def _to_image_data(volume: VolumeData) -> pv.ImageData:
     # volume.values is canonical with index (x, y, z); VTK stores x fastest.
     grid.point_data["scalars"] = volume.values.ravel(order="F")
     return grid
+
+
+def refine_mesh(mesh: pv.PolyData, quality: str) -> pv.PolyData:
+    """Adjust a contour mesh so ``quality`` mostly controls the smoothness.
+
+    A marching-cubes contour is coarse: all of its triangles lie in the
+    original level set, so re-tessellating it *linearly* would only make it
+    denser without looking any smoother. Instead:
+
+    - ``"medium"`` keeps the raw contour;
+    - ``"high"`` applies an approximating Loop subdivision, which rounds the
+      facets into a clean, more fluid surface (Loop was chosen over the
+      interpolating butterfly scheme, whose fixed stencil produced
+      wrinkle-like ripples on these meshes);
+    - ``"low"`` is kept for API compatibility (a light decimation).
+    """
+    if quality == "low":
+        # Fewer triangles: decimate when the mesh is not tiny.
+        if mesh.n_points > 2000:
+            mesh = mesh.decimate(0.5)
+    elif quality == "high":
+        nsub = (
+            _HIGH_SUBDIVIDE_NSUB
+            if mesh.n_points <= _HIGH_SUBDIVIDE_POINT_LIMIT
+            else _HIGH_SUBDIVIDE_NSUB_LARGE
+        )
+        mesh = mesh.subdivide(nsub=nsub, subfilter="loop")
+    return mesh
 
 
 class VolumeRenderer:
@@ -91,7 +120,7 @@ class VolumeRenderer:
             level = _DEFAULT_ISO_FRACTION * max_abs
         level = float(level)
 
-        grid = _to_image_data(volume)
+        grid = to_image_data(volume)
         try:
             positive = grid.contour(isosurfaces=[level])
         except Exception:  # pragma: no cover - no such level
@@ -102,7 +131,7 @@ class VolumeRenderer:
             negative = None
 
         if positive is not None and positive.n_points:
-            positive = self._refine(positive, quality)
+            positive = refine_mesh(positive, quality)
             self._actors.append(
                 self.plotter.add_mesh(
                     positive,
@@ -114,7 +143,7 @@ class VolumeRenderer:
                 )
             )
         if negative is not None and negative.n_points:
-            negative = self._refine(negative, quality)
+            negative = refine_mesh(negative, quality)
             self._actors.append(
                 self.plotter.add_mesh(
                     negative,
@@ -125,31 +154,3 @@ class VolumeRenderer:
                     reset_camera=False,
                 )
             )
-
-    @staticmethod
-    def _refine(mesh: pv.PolyData, quality: str) -> pv.PolyData:
-        """Adjust the mesh so ``quality`` mostly controls the smoothness.
-
-        A marching-cubes contour is coarse: all of its triangles lie in the
-        original level set, so re-tessellating it *linearly* would only make
-        it denser without looking any smoother. Instead:
-
-        - ``"medium"`` keeps the raw contour;
-        - ``"high"`` applies an approximating Loop subdivision, which rounds
-          the facets into a clean, more fluid surface (Loop was chosen over
-          the interpolating butterfly scheme, whose fixed stencil produced
-          wrinkle-like ripples on these meshes);
-        - ``"low"`` is kept for API compatibility (a light decimation).
-        """
-        if quality == "low":
-            # Fewer triangles: decimate when the mesh is not tiny.
-            if mesh.n_points > 2000:
-                mesh = mesh.decimate(0.5)
-        elif quality == "high":
-            nsub = (
-                _HIGH_SUBDIVIDE_NSUB
-                if mesh.n_points <= _HIGH_SUBDIVIDE_POINT_LIMIT
-                else _HIGH_SUBDIVIDE_NSUB_LARGE
-            )
-            mesh = mesh.subdivide(nsub=nsub, subfilter="loop")
-        return mesh
