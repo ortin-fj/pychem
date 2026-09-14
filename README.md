@@ -21,16 +21,23 @@ Done:
 - `Trajectory` model: frames as one array `(n_frames, n_atoms, 3)`, optional
   energies/times, and linear interpolation between frames (`sample()`).
 - Basic atomic data (mass, radii, CPK colors) in `pychem/core/elements.py`.
-- Covalent-radius bond guessing (`pychem/core/bonds.py`).
+- Covalent-radius bond guessing (`pychem/core/bonds.py`) on a spatial grid:
+  only neighbouring cells are compared, so large structures (an 11000-atom
+  PDB) are handled in ~0.1 s and a few MB instead of O(n²) time and memory.
 - **XYZ** and **extended XYZ** reader/writer with `Lattice=...`; multi-frame
   reading to `Molecule` list or a `Trajectory`.
 - **PDB** reader (`pychem/io/pdb.py`): `ATOM`/`HETATM` records become a
   `Molecule` (structure only — multi-model files use the first model).
 - Extensible format registry (`pychem/io/registry.py`).
-- Reusable **PyVista** molecular renderer (spheres per element + bond
-  cylinders): works both in a window and in *offscreen* mode.
+- Reusable **PyVista** molecular renderer (GPU-instanced spheres with
+  per-atom CPK colours + bond cylinders): works both in a window and in
+  *offscreen* mode. Atoms are drawn by a single `vtkGlyph3DMapper` actor, so
+  the geometry never grows with the atom count (an 11000-atom structure stays
+  one sphere instead of a ~7.4M-triangle mesh).
 - **Atom selection**: left-click an atom (compatible with camera rotation),
   subtle selection halo, click again to deselect, click empty space to clear.
+  The atom under the pointer is found analytically (ray against the drawn
+  spheres, ~0.2 ms), so no VTK cell picker is involved.
 - **Trajectory playback**: open a multi-frame XYZ, play/pause/stop, frame
   slider, speed, loop, and **linear interpolation** with an **Auto mode**
   (FPS watchdog with hysteresis) or manual On/Off.
@@ -88,6 +95,25 @@ Done:
   that second line, which is why the entry reminds you of it while you pick
   the files (its tooltip carries the full recipe). The ESP map and the
   orbital/AO isosurfaces are alternatives: showing one clears the other.
+- **Structure editing (Edit section)**: available while a single structure
+  (XYZ/PDB) is open — trajectories and volumetric files are not editable.
+  Three exclusive modes, mirroring the Measurements section:
+  **Move atoms** (drag an atom with the left button; dragging empty space
+  still rotates the camera), **Bonds** (click two atoms to create or delete
+  the bond between them, which hands the connectivity to the model instead
+  of guessing it) and **Umbrella** (pick a *reference* atom, an *axis* atom
+  and any number of *interest* atoms, then drive the group with a slider or
+  by dragging one of its atoms). The umbrella motion keeps every
+  reference-interest distance constant and preserves the azimuth of each
+  interest atom around the reference->axis line: at 90° they are exactly
+  coplanar with the reference (an equilateral triangle when they start 120°
+  apart, the SN2 transition state), 109.47°/70.53° reproduce the reactant and
+  product pyramids and 0°/180° collapse them onto the axis. Leaving a mode
+  (clicking its button again) or switching to another one clears its atom
+  markers. **Undo** (Ctrl+Z)
+  and **Return to initial structure** restore geometry and connectivity, and
+  the edited structure is written out with **File → Export structure
+  (XYZ)...** (plain XYZ stores the coordinates only, not the bonds).
 - **PySide6 GUI** (`pychem/app/`): open a structure, export a PNG image,
   reset the camera, a fixed side panel with atom properties and trajectory
   controls, status bar.
@@ -104,7 +130,7 @@ Done:
   Modes: GUI (default), *offscreen* render (`--screenshot`) and text summary
   (`--info`). With no file argument the GUI opens empty — use File > Open
   structure... to load a file.
-- Tests with pytest (90 tests).
+- Tests with pytest (113 tests).
 
 In progress / next:
 

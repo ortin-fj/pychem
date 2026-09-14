@@ -59,7 +59,14 @@ def _hill_formula(counts: dict[str, int]) -> str:
 
 @dataclass
 class Molecule:
-    """A set of atoms forming a molecular structure or a frame."""
+    """A set of atoms forming a molecular structure or a frame.
+
+    ``bonds`` is an optional explicit connectivity as an ``(m, 2)`` array of
+    atom indices with ``i < j``. ``None`` means "no explicit connectivity":
+    consumers (e.g. the renderer) guess it from the geometry. Editing the
+    structure in the GUI turns it into an explicit list, which can be
+    authored with :mod:`pychem.core.editing`.
+    """
 
     symbols: list[str]
     coords: np.ndarray  # shape (n_atoms, 3), Å
@@ -67,6 +74,7 @@ class Molecule:
     charge: int = 0
     multiplicity: int = 1
     metadata: dict[str, object] = field(default_factory=dict)
+    bonds: np.ndarray | None = None  # (m, 2) int, i < j, or None (auto)
 
     def __post_init__(self) -> None:
         coords = np.asarray(self.coords, dtype=float)
@@ -76,6 +84,13 @@ class Molecule:
                 f"coords must have shape ({n_atoms}, 3); got {coords.shape}"
             )
         self.coords = coords
+        if self.bonds is not None:
+            arr = np.asarray(self.bonds, dtype=np.int64).reshape(-1, 2)
+            if arr.size:
+                arr = np.sort(arr, axis=1)
+                if (arr[:, 0] < 0).any() or (arr[:, 1] >= n_atoms).any():
+                    raise ValueError("bond indices out of range")
+            self.bonds = arr
 
     @property
     def n_atoms(self) -> int:
@@ -106,6 +121,9 @@ class Molecule:
     def copy(self, *, deep: bool = True) -> "Molecule":
         """Copy the molecule. Copies the coordinates by default."""
         coords = self.coords.copy() if deep else self.coords
+        bonds = None
+        if self.bonds is not None:
+            bonds = self.bonds.copy() if deep else self.bonds
         return Molecule(
             symbols=list(self.symbols),
             coords=coords,
@@ -113,6 +131,7 @@ class Molecule:
             charge=self.charge,
             multiplicity=self.multiplicity,
             metadata=dict(self.metadata),
+            bonds=bonds,
         )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging

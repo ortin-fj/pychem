@@ -11,6 +11,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 
+import numpy as np  # noqa: E402
+
 pyside6 = pytest.importorskip("PySide6")
 
 DATA = Path(__file__).parent / "data" / "xyz"
@@ -133,22 +135,62 @@ def test_side_sections_collapsible_and_resizable(qapp):
     assert props_box.toggle_button.text() == props_box._MIN_GLYPH  # expanded
 
     # Clicking the header button minimizes a section (body hidden) and the
-    # glyph swaps to the expand one; clicking again restores it.
+    # glyph swaps to the expand one; clicking again restores it. Collapsing
+    # hides the body *container* so the application's own hidden widgets are
+    # left untouched; the body widgets are therefore not explicitly hidden.
     assert not window._meas_box.isHidden()  # molecule loaded -> visible
     window._meas_box.toggle_button.click()
     qapp.processEvents()
     assert window._meas_box.is_collapsed()
-    assert window._meas_buttons["bonds"].isHidden()
+    assert window._meas_box.body.isHidden()
     assert window._meas_box.toggle_button.text() == window._meas_box._EXPAND_GLYPH
     assert window._meas_box.maximumHeight() <= window._meas_box.header_height()
 
     window._meas_box.toggle_button.click()
     qapp.processEvents()
     assert not window._meas_box.is_collapsed()
-    assert not window._meas_buttons["bonds"].isHidden()
+    assert not window._meas_box.body.isHidden()
     assert window._meas_box.toggle_button.text() == window._meas_box._MIN_GLYPH
     # Expanding frees the height again so the body is not squeezed.
     assert window._meas_box.maximumHeight() > window._meas_box.header_height()
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_collapse_expand_preserves_app_hidden_widgets(qapp):
+    """Regression: expanding a section must not resurrect hidden widgets.
+
+    The umbrella controls (and the isovalue/quality rows) are hidden by the
+    application while their mode is off; a collapse/expand cycle of the
+    section used to show them again, because every body widget was blindly
+    re-shown on expand.
+    """
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=DATA / "sn2_opt.xyz")
+    qapp.processEvents()
+    assert window._umbrella_box.isHidden()
+
+    window._edit_box.set_collapsed(True)
+    window._edit_box.set_collapsed(False)
+    qapp.processEvents()
+    assert not window._edit_box.is_collapsed()
+    assert window._umbrella_box.isHidden()
+    window.close()
+    qapp.processEvents()
+
+    # Same for the volumetric rows, hidden until the first plot.
+    window = MainWindow(filename=VOLUME_DATA / "single_point.molden")
+    qapp.processEvents()
+    assert window._iso_row.isHidden()
+    assert window._qual_row.isHidden()
+
+    window._vol_box.set_collapsed(True)
+    window._vol_box.set_collapsed(False)
+    qapp.processEvents()
+    assert window._iso_row.isHidden()
+    assert window._qual_row.isHidden()
 
     window.close()
     qapp.processEvents()
@@ -188,13 +230,13 @@ def test_section_header_click_toggles(qapp):
     header_click()
     qapp.processEvents()
     assert box.is_collapsed()
-    assert window._props_scroll.isHidden()
+    assert box.body.isHidden()
 
     # ...and a second click on the (now header-only) box expands it again.
     header_click()
     qapp.processEvents()
     assert not box.is_collapsed()
-    assert not window._props_scroll.isHidden()
+    assert not box.body.isHidden()
 
     # Clicks below the header (over the body) must NOT toggle the section.
     press = QMouseEvent(
@@ -856,6 +898,285 @@ def test_esp_and_orbital_isosurfaces_are_alternatives(qapp):
     assert window._esp_pair is None
     assert not window._act_visualize_esp.isChecked()
     assert len(window.vol_renderer._actors) >= 1
+
+    window.close()
+    qapp.processEvents()
+
+
+# -- structure editing --------------------------------------------------------
+
+
+def test_edit_section_only_for_single_structures(qapp):
+    from pychem.app import MainWindow
+
+    # A plain XYZ structure: the Edit section shows and export is enabled.
+    window = MainWindow(filename=DATA / "water.xyz")
+    qapp.processEvents()
+    assert not window._edit_box.isHidden()
+    assert window._edit_mode is None
+    assert window._act_export_structure.isEnabled()
+    window.close()
+    qapp.processEvents()
+
+    # A multi-frame XYZ becomes a Trajectory, which cannot be edited.
+    window = MainWindow(filename=DATA / "water_traj.xyz")
+    qapp.processEvents()
+    assert window._edit_box.isHidden()
+    assert not window._act_export_structure.isEnabled()
+    window.close()
+    qapp.processEvents()
+
+
+def test_move_atoms_by_drag_and_undo(qapp):
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=DATA / "water.xyz")
+    qapp.processEvents()
+    before = window._molecule.coords.copy()
+
+    window._edit_buttons["move"].setChecked(True)
+    qapp.processEvents()
+    assert window._edit_mode == "move"
+    # The umbrella controls belong to the umbrella mode only.
+    assert window._umbrella_box.isHidden()
+
+    target = before[0] + np.array([0.5, 0.0, 0.0])
+    window._on_atom_dragged(0, target)
+    qapp.processEvents()
+    assert np.allclose(window._molecule.coords[0], target)
+
+    window.undo_edit()
+    qapp.processEvents()
+    assert np.allclose(window._molecule.coords, before)
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_bonds_mode_toggles_connectivity_and_undo(qapp):
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=DATA / "water.xyz")
+    qapp.processEvents()
+    window._edit_buttons["bonds"].setChecked(True)
+    qapp.processEvents()
+    assert window._edit_mode == "bonds"
+    # Guessed connectivity is not stored on the model yet.
+    assert window._molecule.bonds is None
+
+    # Water is O-H, O-H: clicking that pair deletes the bond and switches the
+    # model to an explicit connectivity.
+    window._on_atom_clicked(0)
+    assert window._bond_pending == 0
+    window._on_atom_clicked(1)
+    qapp.processEvents()
+    assert window._molecule.bonds is not None
+    assert window._molecule.bonds.tolist() == [[0, 2]]
+
+    window.undo_edit()
+    qapp.processEvents()
+    assert window._molecule.bonds is None
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_umbrella_mode_planar_collapse_and_reset(qapp):
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=DATA / "sn2_opt.xyz")
+    qapp.processEvents()
+    original = window._molecule.coords.copy()
+
+    assert window._umbrella_box.isHidden()
+    window._edit_buttons["umbrella"].setChecked(True)
+    qapp.processEvents()
+    assert window._edit_mode == "umbrella"
+    assert not window._umbrella_box.isHidden()
+
+    # C(0) is the reference, Br(4) the axis and the three H the interests.
+    window._on_umbrella_click(0)
+    window._on_umbrella_click(4)
+    for h in (1, 2, 3):
+        window._on_umbrella_click(h)
+    qapp.processEvents()
+    assert window._umbrella is not None
+    assert window._umbrella.reference == 0
+    assert window._umbrella.axis_atom == 4
+    assert window._umbrella.interests == (1, 2, 3)
+    assert window._umbrella_slider.isEnabled()
+
+    c = window._molecule.coords[0].copy()
+    axis = window._umbrella.axis.copy()
+    radii0 = np.linalg.norm(original[[1, 2, 3]] - c, axis=1)
+
+    # Planar transition state: in the C plane, equilateral, distances kept.
+    window._set_umbrella_angle(90.0)
+    qapp.processEvents()
+    planar = window._molecule.coords[[1, 2, 3]].copy()
+    assert np.allclose((planar - c) @ axis, 0.0, atol=1e-9)
+    sides = [
+        float(np.linalg.norm(planar[i] - planar[j]))
+        for i, j in ((0, 1), (1, 2), (0, 2))
+    ]
+    # The real optimized geometry is only nearly symmetric (its azimuths are
+    # not exactly 120 deg apart), so the triangle is nearly equilateral.
+    assert max(sides) - min(sides) < 1e-2
+    assert np.allclose(np.linalg.norm(planar - c, axis=1), radii0, atol=1e-9)
+
+    # Over-rotating collapses the three H onto the axis: they meet at
+    # reference + r * axis, within the tiny r_i differences of the input.
+    window._set_umbrella_angle(0.0)
+    qapp.processEvents()
+    collapsed = window._molecule.coords[[1, 2, 3]]
+    assert np.max(np.linalg.norm(collapsed - collapsed[0], axis=1)) < 1e-3
+    assert np.allclose(np.linalg.norm(collapsed - c, axis=1), radii0, atol=1e-9)
+
+    # Return to the initial structure restores everything.
+    window._return_to_initial_structure()
+    qapp.processEvents()
+    assert np.allclose(window._molecule.coords, original)
+    assert window._umbrella is None
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_leaving_umbrella_mode_clears_its_highlight(qapp):
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=DATA / "sn2_opt.xyz")
+    qapp.processEvents()
+    window._edit_buttons["umbrella"].setChecked(True)
+    window._on_umbrella_click(0)
+    window._on_umbrella_click(4)
+    window._on_umbrella_click(1)
+    qapp.processEvents()
+    assert window._umbrella is not None
+    # Reference/axis/interests are marked in the viewer.
+    assert window.renderer._meas_actors
+
+    # Clicking the active mode button again leaves the mode and clears the
+    # markers (the roles are forgotten too).
+    window._edit_buttons["umbrella"].setChecked(False)
+    qapp.processEvents()
+    assert window._edit_mode is None
+    assert window._umbrella is None
+    assert window._umbrella_ref is None
+    assert window._umbrella_axis is None
+    assert window._umbrella_interests == []
+    assert window.renderer._meas_actors == []
+    assert window._umbrella_box.isHidden()
+
+    # Switching straight to another edit mode also drops the stale markers.
+    window._edit_buttons["umbrella"].setChecked(True)
+    window._on_umbrella_click(0)
+    qapp.processEvents()
+    assert window.renderer._meas_actors
+    window._edit_buttons["move"].setChecked(True)
+    qapp.processEvents()
+    assert window._edit_mode == "move"
+    assert window.renderer._meas_actors == []
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_umbrella_drag_along_the_axis_drives_the_angle(qapp):
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=DATA / "sn2_opt.xyz")
+    qapp.processEvents()
+    window._edit_buttons["umbrella"].setChecked(True)
+    window._on_umbrella_click(0)
+    window._on_umbrella_click(4)
+    for h in (1, 2, 3):
+        window._on_umbrella_click(h)
+    qapp.processEvents()
+
+    window._set_umbrella_angle(90.0)
+    qapp.processEvents()
+    origin = window._molecule.coords[1].copy()
+    axis = window._umbrella.axis.copy()
+    radius = float(np.mean(window._umbrella.radii))
+
+    # The renderer reports absolute positions measured from the press origin,
+    # so successive moves must follow the total displacement (no accumulation).
+    window._on_atom_dragged(1, origin + 0.25 * radius * axis)
+    first = window._umbrella_angle
+    window._on_atom_dragged(1, origin + 0.5 * radius * axis)
+    second = window._umbrella_angle
+    assert second < first < 90.0
+    assert second == pytest.approx(60.0, abs=1e-6)  # acos(0.5)
+    window._on_drag_finished()
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_edited_geometry_exports_to_xyz(qapp, tmp_path):
+    from pychem.app import MainWindow
+    from pychem.io.xyz import read_xyz, write_xyz
+
+    window = MainWindow(filename=DATA / "water.xyz")
+    qapp.processEvents()
+    window._edit_buttons["move"].setChecked(True)
+    moved = window._molecule.coords[1] + np.array([0.2, 0.0, 0.0])
+    window._on_atom_dragged(1, moved)
+    qapp.processEvents()
+
+    path = tmp_path / "edited.xyz"
+    write_xyz(path, window._molecule)
+    reloaded = read_xyz(path)
+    assert np.allclose(reloaded.coords, window._molecule.coords)
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_ctrl_z_undoes_in_move_mode(qapp):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=DATA / "water.xyz")
+    window.show()
+    window.activateWindow()
+    qapp.processEvents()
+    before = window._molecule.coords.copy()
+
+    window._edit_buttons["move"].setChecked(True)
+    window._on_atom_dragged(1, before[1] + np.array([0.2, 0.0, 0.0]))
+    qapp.processEvents()
+    assert not np.allclose(window._molecule.coords, before)
+
+    # The window-level shortcut works even though the Undo button lives in a
+    # section that can be collapsed.
+    QTest.keyClick(window, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    qapp.processEvents()
+    assert np.allclose(window._molecule.coords, before)
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_edit_instructions_use_the_status_bar(qapp):
+    from pychem.app import MainWindow
+
+    window = MainWindow(filename=DATA / "sn2_opt.xyz")
+    qapp.processEvents()
+
+    # The umbrella box no longer repeats the instructions.
+    assert not hasattr(window, "_umbrella_info")
+    # Status messages use the section-title accent (bold #87D68D).
+    assert "87D68D" in window.statusBar().styleSheet()
+
+    window._edit_buttons["umbrella"].setChecked(True)
+    qapp.processEvents()
+    assert "click the reference atom" in window.statusBar().currentMessage()
+    # Only the numeric readout lives inside the umbrella box.
+    assert window._umbrella_angle_label.text() == ""
 
     window.close()
     qapp.processEvents()

@@ -22,8 +22,9 @@ from pathlib import Path
 import numpy as np
 
 from PySide6.QtCore import QLocale, QTimer, Qt
-from PySide6.QtGui import QMouseEvent, QResizeEvent
+from PySide6.QtGui import QKeySequence, QMouseEvent, QResizeEvent, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDockWidget,
@@ -51,10 +52,12 @@ from pyvistaqt import QtInteractor
 from pychem import __version__ as PYCHEN_VERSION
 from pychem.core import geometry
 from pychem.core.bonds import guess_bonds, update_dynamic_bonds
+from pychem.core.editing import UmbrellaGroup, toggle_bond
 from pychem.core.molecule import Molecule
 from pychem.core.trajectory import Trajectory
 from pychem.core.volume import VolumeData
 from pychem.io import get_reader
+from pychem.io.xyz import write_xyz
 from pychem.io.volumetric import (
     DENSITY_LABEL,
     POTENTIAL_LABEL,
@@ -120,6 +123,38 @@ _MEAS_MODES = (
     ("dihedrals", "Dihedrals"),
 )
 _MEAS_NEEDED = {"bonds": 2, "angles": 3, "dihedrals": 4}
+
+# Edit-section modes: (internal key, button label).
+_EDIT_MODES = (
+    ("move", "Move atoms"),
+    ("bonds", "Bonds"),
+    ("umbrella", "Umbrella"),
+)
+_EDIT_TIPS = {
+    "move": (
+        "Drag an atom with the left mouse button; dragging empty space "
+        "still rotates the camera."
+    ),
+    "bonds": "Click two atoms to create or delete the bond between them.",
+    "umbrella": (
+        "Rotate the interest atoms around the reference->axis line: the "
+        "reference-interest distances stay constant, 90 deg is planar and "
+        "0/180 deg collapses them onto the axis."
+    ),
+}
+
+# Umbrella slider range (absolute polar angle from the reference->axis line).
+_UMBRELLA_MIN_DEG = 0
+_UMBRELLA_MAX_DEG = 180
+
+_START_STRUCTURE_HINT = ("Tip: pick an atom to move it with the mouse.")
+
+# Status-bar messages double as the interaction prompts, so they use the same
+# accent as the section titles: bold and #87D68D.
+_STATUS_STYLE = (
+    "QStatusBar { color: #87D68D; font-weight: bold; }"
+    "QStatusBar QLabel { color: #87D68D; font-weight: bold; }"
+)
 
 
 class _IsoSpinBox(QDoubleSpinBox):
@@ -206,6 +241,20 @@ class _CollapsibleBox(QGroupBox):
         font.setBold(True)
         self.setFont(font)
 
+        # The body lives in a dedicated container, and collapsing hides/shows
+        # only that container. Hiding the individual body widgets would make
+        # the application's own visibility state impossible to restore: a
+        # widget hidden on purpose (the umbrella controls outside their mode,
+        # the isovalue rows before the first plot, the second AO picker...) was
+        # shown again on expand, because "hidden" cannot be told apart from
+        # "hidden by the collapse".
+        self.body = QWidget(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self.body)
+        self.body_layout = QVBoxLayout(self.body)
+
         # Small window-style button pinned to the right of the header strip.
         self.toggle_button = QToolButton(self)
         self.toggle_button.setObjectName("sectionToggleButton")
@@ -263,13 +312,9 @@ class _CollapsibleBox(QGroupBox):
         self._refresh_button()
 
     def _set_body_visible(self, visible: bool) -> None:
-        lay = self.layout()
-        if lay is not None:
-            for i in range(lay.count()):
-                item = lay.itemAt(i)
-                widget = item.widget()
-                if widget is not None:
-                    widget.setVisible(visible)
+        # Only the container is toggled: the visibility of the widgets inside
+        # it is owned by the application and survives collapse/expand.
+        self.body.setVisible(visible)
         if visible:
             # Free the height again: the splitter redistributes the space.
             self.setMaximumHeight(16777215)
@@ -335,6 +380,9 @@ class _PropertiesPanel(QWidget):
         " color: #87D68D; font-weight: bold; }"
         "QToolButton#sectionToggleButton:hover { color: #b3edba; }"
         "QFrame#aoSecondBox { border: 1px solid #c3cfc3; border-radius: 4px; }"
+        "QFrame#umbrellaBox { border: 1px solid #c3cfc3; border-radius: 4px; }"
+        "QFrame#umbrellaBox QWidget { font-weight: normal; }"
+        "QFrame#umbrellaBox QLabel { color: #40544a; }"
     )
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -387,6 +435,25 @@ class MainWindow(QMainWindow):
         self._meas_mode: str | None = None
         self._meas_atoms: list[int] = []
         self._meas_buttons: dict[str, QPushButton] = {}
+        # Structure editing (Edit section). Only single structures (XYZ/PDB)
+        # are editable; ``_original_molecule`` keeps the loaded state for
+        # "Return to initial structure" and Undo keeps coordinate/bond copies.
+        self._act_export_structure = None
+        self._edit_mode: str | None = None
+        self._edit_buttons: dict[str, QPushButton] = {}
+        self._original_molecule: Molecule | None = None
+        self._undo_stack: list[tuple[np.ndarray, np.ndarray | None]] = []
+        self._bond_pending: int | None = None
+        self._umbrella: UmbrellaGroup | None = None
+        self._umbrella_ref: int | None = None
+        self._umbrella_axis: int | None = None
+        self._umbrella_interests: list[int] = []
+        self._umbrella_dragging = False
+        self._umbrella_drag_origin: np.ndarray | None = None
+        self._umbrella_base_angle = 0.0
+        self._umbrella_angle = 0.0
+        self._updating_umbrella = False
+        self._dragging = False
 
         self.setWindowTitle("PyChem")
         self.resize(1100, 800)
@@ -395,11 +462,21 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_properties_dock()
         self._build_measurement_controls()
+        self._build_edit_controls()
         self._setup_picking()
         self._build_trajectory_controls()
         self._build_volumetric_controls()
         self._build_side_stretch()
+        self.statusBar().setStyleSheet(_STATUS_STYLE)
         self.statusBar().showMessage("Ready. Use File > Open to load a structure.")
+
+        # Window-level Undo. A shortcut on the button itself would be inactive
+        # while the Edit section is collapsed or hidden, so it is bound to the
+        # window instead and works from every mode (it is a no-op when the
+        # undo stack is empty).
+        self._undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self._undo_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._undo_shortcut.activated.connect(self.undo_edit)
 
         if filename is not None:
             self.open_path(filename)
@@ -433,7 +510,7 @@ class MainWindow(QMainWindow):
         # --- Atom Properties section ---------------------------------------
         props_box = _CollapsibleBox("Atom Properties")
         props_box.toggled.connect(self._on_section_toggled)
-        props_layout = QVBoxLayout(props_box)
+        props_layout = props_box.body_layout
         props_layout.setContentsMargins(8, 12, 8, 8)
         scroll = QScrollArea(props_box)
         scroll.setWidgetResizable(True)
@@ -574,11 +651,21 @@ class MainWindow(QMainWindow):
         drag (camera rotation) does not change the selection.
         """
         self.renderer.enable_atom_picking(
-            self._on_atom_picked, empty_callback=self._on_empty_click
+            self._on_atom_picked,
+            empty_callback=self._on_empty_click,
+            click_callback=self._on_atom_clicked,
         )
 
     def _on_empty_click(self) -> None:
         """Click on empty space/bonds: reset the current interaction."""
+        if self._edit_mode == "bonds" and self._bond_pending is not None:
+            self._bond_pending = None
+            self.renderer.select_atom(None)
+            self._update_properties(None)
+            self.statusBar().showMessage(self._bond_prompt())
+            return
+        if self._edit_mode == "umbrella":
+            return
         if self._meas_mode is not None:
             # In a measurement mode an empty click restarts the selection.
             if self._meas_atoms:
@@ -602,6 +689,13 @@ class MainWindow(QMainWindow):
         act_export = file_menu.addAction("&Export image...")
         act_export.setShortcut("Ctrl+E")
         act_export.triggered.connect(self.export_image)
+
+        act_export_xyz = file_menu.addAction("Export &structure (XYZ)...")
+        # Only single structures can be edited and exported as XYZ; the
+        # action is enabled from ``open_path``.
+        act_export_xyz.setEnabled(False)
+        act_export_xyz.triggered.connect(self.export_structure)
+        self._act_export_structure = act_export_xyz
 
         file_menu.addSeparator()
         act_exit = file_menu.addAction("E&xit")
@@ -670,11 +764,25 @@ class MainWindow(QMainWindow):
     def open_path(self, path: str | Path) -> None:
         """Load a structure/trajectory/volume and show it in the viewer."""
         path = Path(path)
+        # Reading a large structure and guessing its bonds takes long enough to
+        # be noticed, so show what is happening and let Qt paint it before the
+        # work starts (the window would otherwise look frozen).
+        self.statusBar().showMessage(f"Loading {path.name}…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        load_error: Exception | None = None
         try:
             data = self._load(path)
         except Exception as exc:  # noqa: BLE001 - reader errors to the UI
-            QMessageBox.critical(self, "Error opening file", str(exc))
+            load_error = exc
+        finally:
+            # Restore before any dialog, so the error box is not shown with a
+            # busy cursor stuck on top of it.
+            QApplication.restoreOverrideCursor()
+        if load_error is not None:
+            QMessageBox.critical(self, "Error opening file", str(load_error))
             return
+        assert data is not None  # the error path returned above
 
         self._set_playing(False)
         self.vol_renderer.clear()
@@ -687,6 +795,7 @@ class MainWindow(QMainWindow):
         self._ao_manual_iso = False
         self._ao2_plotted = False
         self._reset_measurement_mode()
+        self._exit_edit_mode()
 
         trajectory = data if isinstance(data, Trajectory) else None
         volfile = data if isinstance(data, VolumetricFile) else None
@@ -699,6 +808,15 @@ class MainWindow(QMainWindow):
         self._trajectory = trajectory
         self._volfile = volfile
         self._molecule = molecule
+        # Only plain single structures (XYZ/PDB) can be edited: with a
+        # trajectory the geometry is driven by the playback, and with a
+        # volumetric file the isosurfaces would desync from moved atoms.
+        editable = trajectory is None and volfile is None
+        self._original_molecule = molecule.copy() if editable else None
+        self._undo_stack = []
+        self._set_edit_controls_visible(editable)
+        if self._act_export_structure is not None:
+            self._act_export_structure.setEnabled(editable)
         self.renderer.show(molecule)
         self.plotter.reset_camera()
         self.renderer.select_atom(None)
@@ -794,6 +912,10 @@ class MainWindow(QMainWindow):
         """Receive a picked atom index and update the selection/measurement."""
         if self.renderer.molecule is None:
             return
+        if self._edit_mode in ("bonds", "umbrella"):
+            # These modes act on the click (release), so starting a camera
+            # drag on an atom must not change the selection here.
+            return
         if self._meas_mode is not None:
             self._on_measurement_atom(index)
             return
@@ -845,7 +967,7 @@ class MainWindow(QMainWindow):
         """Build the Measurements section: three exclusive mode buttons."""
         box = _CollapsibleBox("Measurements")
         box.toggled.connect(self._on_section_toggled)
-        layout = QVBoxLayout(box)
+        layout = box.body_layout
         layout.setSpacing(4)
         layout.setContentsMargins(10, 8, 10, 8)
         for key, label in _MEAS_MODES:
@@ -987,6 +1109,479 @@ class MainWindow(QMainWindow):
             f"{self._measurement_name(key)}: {label}"
         )
 
+    # -- structure editing ---------------------------------------------------
+
+    def _build_edit_controls(self) -> None:
+        """Build the Edit section: move atoms, bonds and the umbrella mode.
+
+        The three modes are exclusive (like the measurement ones). Move and
+        Umbrella drive the renderer's dragging interaction; Bonds reacts to
+        clicks only. Undo and "Return to initial structure" are available in
+        every mode.
+        """
+        box = _CollapsibleBox("Edit")
+        box.toggled.connect(self._on_section_toggled)
+        layout = box.body_layout
+        layout.setSpacing(4)
+        layout.setContentsMargins(10, 8, 10, 8)
+
+        for key, label in _EDIT_MODES:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setToolTip(_EDIT_TIPS[key])
+            btn.toggled.connect(
+                lambda checked, k=key: self._on_edit_mode_toggled(k, checked)
+            )
+            layout.addWidget(btn)
+            self._edit_buttons[key] = btn
+
+        # Umbrella controls: revealed only while the umbrella mode is active.
+        umbrella = QFrame(box)
+        umbrella.setObjectName("umbrellaBox")
+        u_layout = QVBoxLayout(umbrella)
+        u_layout.setContentsMargins(6, 6, 6, 6)
+        u_layout.setSpacing(4)
+        # Only the numeric readout lives in the box; the instructions are
+        # shown in the status bar (under the viewer) instead of duplicating
+        # them here, where they were hard to read.
+        self._umbrella_angle_label = QLabel("", umbrella)
+        u_layout.addWidget(self._umbrella_angle_label)
+        slider = QSlider(Qt.Orientation.Horizontal, umbrella)
+        slider.setRange(_UMBRELLA_MIN_DEG, _UMBRELLA_MAX_DEG)
+        slider.setToolTip(
+            "Polar angle of the interest atoms around the reference->axis "
+            "line. 90 deg makes them planar (transition state); 0/180 deg "
+            "collapses them onto the axis."
+        )
+        slider.sliderPressed.connect(self._on_umbrella_slider_pressed)
+        slider.valueChanged.connect(self._on_umbrella_slider)
+        u_layout.addWidget(slider)
+        self._umbrella_slider = slider
+        umbrella.setVisible(False)
+        layout.addWidget(umbrella)
+        self._umbrella_box = umbrella
+
+        undo_btn = QPushButton("Undo")
+        undo_btn.setToolTip("Undo the last geometry/bond change (Ctrl+Z).")
+        undo_btn.clicked.connect(self.undo_edit)
+        layout.addWidget(undo_btn)
+        reset_btn = QPushButton("Return to initial structure")
+        reset_btn.setToolTip(
+            "Restore the structure as it was loaded (geometry and bonds)."
+        )
+        reset_btn.clicked.connect(self._return_to_initial_structure)
+        layout.addWidget(reset_btn)
+
+        self._side_splitter.addWidget(box)
+        self._edit_box = box
+        box.setVisible(False)
+
+    def _set_edit_controls_visible(self, visible: bool) -> None:
+        """Show/hide the Edit section (leaving the current edit mode)."""
+        if not hasattr(self, "_edit_box"):
+            return
+        if not visible:
+            self._exit_edit_mode()
+        self._edit_box.setVisible(visible)
+
+    def _clear_umbrella_session(self) -> None:
+        """Forget the umbrella roles and remove their highlight overlay.
+
+        Used both when leaving an edit mode and when entering one, so the
+        reference/axis/interest markers never linger on the atoms once the
+        mode is switched off or changed.
+        """
+        self._umbrella = None
+        self._umbrella_ref = None
+        self._umbrella_axis = None
+        self._umbrella_interests = []
+        self._umbrella_angle = 0.0
+        self._umbrella_dragging = False
+        self._umbrella_drag_origin = None
+        self._umbrella_base_angle = 0.0
+        if hasattr(self, "renderer"):
+            self.renderer.clear_measurement()
+        if hasattr(self, "_umbrella_angle_label"):
+            self._umbrella_angle_label.setText("")
+
+    def _edit_mode_name(self, key: str) -> str:
+        return dict(_EDIT_MODES)[key]
+
+    def _on_edit_mode_toggled(self, key: str, checked: bool) -> None:
+        """Handle an edit-mode button being toggled (exclusive modes)."""
+        if checked:
+            for other, btn in self._edit_buttons.items():
+                if other != key and btn.isChecked():
+                    btn.blockSignals(True)
+                    btn.setChecked(False)
+                    btn.blockSignals(False)
+            self._enter_edit_mode(key)
+        elif self._edit_mode == key:
+            self._exit_edit_mode()
+
+    def _enter_edit_mode(self, key: str) -> None:
+        """Activate an edit mode (and set up its mouse interaction).
+
+        Every entry starts from a clean slate: the previous mode's roles and
+        overlays are dropped, so switching modes never leaves stale markers.
+        """
+        self.renderer.disable_atom_moving()
+        # Measurements also consume atom clicks: both modes are exclusive.
+        self._reset_measurement_mode()
+        self._clear_umbrella_session()
+        self._bond_pending = None
+        self._dragging = False
+        self._edit_mode = key
+        self._umbrella_box.setVisible(key == "umbrella")
+        if key in ("move", "umbrella"):
+            # The umbrella session starts empty, so nothing is draggable yet;
+            # ``_rebuild_umbrella`` refreshes the set as roles are picked.
+            movable = [] if key == "umbrella" else None
+            self.renderer.enable_atom_moving(
+                self._on_atom_dragged,
+                movable=movable,
+                select_callback=self._on_atom_picked,
+                click_callback=self._on_atom_clicked,
+                finish_callback=self._on_drag_finished,
+            )
+        if key == "umbrella":
+            self._rebuild_umbrella()
+        else:
+            self._update_umbrella_info()
+        self._refresh_edit_status()
+
+    def _exit_edit_mode(self) -> None:
+        """Leave the edit mode: stop dragging and drop every edit overlay.
+
+        Clicking an active mode button again clears the atom selection and the
+        umbrella/reference markers, mirroring how the measurement modes behave.
+        """
+        if hasattr(self, "renderer"):
+            self.renderer.disable_atom_moving()
+        self._edit_mode = None
+        self._bond_pending = None
+        self._dragging = False
+        self._clear_umbrella_session()
+        if hasattr(self, "_umbrella_box"):
+            self._umbrella_box.setVisible(False)
+        for btn in self._edit_buttons.values():
+            if btn.isChecked():
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+        if hasattr(self, "renderer") and self.renderer.molecule is not None:
+            self.renderer.select_atom(None)
+            self._update_properties(None)
+        if hasattr(self, "_file_status"):
+            self.statusBar().showMessage(self._file_status or "Ready.")
+
+    def _refresh_edit_status(self) -> None:
+        if self._edit_mode == "move":
+            self.statusBar().showMessage(
+                "Move atoms: drag an atom with the mouse "
+                "(drag empty space to rotate the camera)."
+            )
+        elif self._edit_mode == "bonds":
+            self.statusBar().showMessage(self._bond_prompt())
+        elif self._edit_mode == "umbrella":
+            self.statusBar().showMessage(self._umbrella_prompt())
+
+    # -- shared edit plumbing ------------------------------------------------
+
+    def _push_undo(self) -> None:
+        """Snapshot coordinates and bonds before a change (bounded stack)."""
+        molecule = self.renderer.molecule
+        if molecule is None:
+            return
+        bonds = None if molecule.bonds is None else molecule.bonds.copy()
+        self._undo_stack.append((molecule.coords.copy(), bonds))
+        if len(self._undo_stack) > 100:
+            self._undo_stack.pop(0)
+
+    def undo_edit(self) -> None:
+        """Restore the last snapshot taken before an edit."""
+        if not self._undo_stack:
+            self.statusBar().showMessage("Nothing to undo.")
+            return
+        molecule = self.renderer.molecule
+        if molecule is None:
+            return
+        coords, bonds = self._undo_stack.pop()
+        molecule.coords[:, :] = coords
+        molecule.bonds = None if bonds is None else bonds.copy()
+        if self._edit_mode == "umbrella":
+            self._rebuild_umbrella()
+        self._redraw_edited()
+        self.statusBar().showMessage("Undo.")
+
+    def _redraw_edited(self) -> None:
+        """Rebuild the scene after an edit, keeping camera and selection.
+
+        ``MolecularRenderer.show`` never resets the camera, so editing does
+        not move the view. The measurement and atom-ID overlays are rebuilt
+        for the new geometry.
+        """
+        molecule = self.renderer.molecule
+        if molecule is None:
+            return
+        selected = self.renderer.selected_index
+        self.renderer.show(molecule)
+        if selected is not None and selected < molecule.n_atoms:
+            self.renderer.select_atom(selected)
+        if self._edit_mode == "umbrella":
+            self._refresh_umbrella_highlight()
+        if self.isVisible():
+            self.plotter.render()
+
+    def _return_to_initial_structure(self) -> None:
+        """Restore the geometry and connectivity exactly as loaded."""
+        original = self._original_molecule
+        molecule = self.renderer.molecule
+        if original is None or molecule is None:
+            return
+        self._push_undo()
+        molecule.coords[:, :] = original.coords
+        molecule.bonds = (
+            None if original.bonds is None else original.bonds.copy()
+        )
+        self._umbrella_ref = None
+        self._umbrella_axis = None
+        self._umbrella_interests = []
+        if self._edit_mode == "umbrella":
+            self._rebuild_umbrella()
+        self.renderer.select_atom(None)
+        self._redraw_edited()
+        self._update_properties(None)
+        self.statusBar().showMessage("Returned to the initial structure.")
+
+    # -- click dispatch ------------------------------------------------------
+
+    def _on_atom_clicked(self, index: int) -> None:
+        """A genuine click on an atom (no camera drag) reached an edit mode."""
+        if self._edit_mode == "bonds":
+            self._on_bond_click(index)
+        elif self._edit_mode == "umbrella":
+            self._on_umbrella_click(index)
+
+    def _on_drag_finished(self) -> None:
+        self._dragging = False
+        self._umbrella_dragging = False
+        self._umbrella_drag_origin = None
+
+    def _on_atom_dragged(self, index: int, new_position: np.ndarray) -> None:
+        """Move an atom (Move mode) or drive the umbrella angle (Umbrella)."""
+        molecule = self.renderer.molecule
+        if molecule is None:
+            return
+        index = int(index)
+        if self._edit_mode == "move":
+            if np.allclose(molecule.coords[index], new_position, atol=1e-6):
+                return
+            if not self._dragging:
+                self._push_undo()
+                self._dragging = True
+            molecule.coords[index] = new_position
+            self._redraw_edited()
+        elif self._edit_mode == "umbrella" and self._umbrella is not None:
+            if index not in self._umbrella.interests:
+                return
+            if not self._umbrella_dragging:
+                # The renderer reports absolute positions measured from the
+                # press origin, so the origin and the base angle are frozen
+                # once here (they must not follow the moving atom).
+                self._push_undo()
+                self._umbrella_dragging = True
+                self._dragging = True
+                self._umbrella_drag_origin = np.asarray(
+                    molecule.coords[index], dtype=float
+                ).copy()
+                self._umbrella_base_angle = self._umbrella_angle
+            if self._umbrella_drag_origin is None:
+                return
+            displacement = new_position - self._umbrella_drag_origin
+            angle = self._umbrella.angle_from_displacement(
+                self._umbrella_base_angle, displacement
+            )
+            self._set_umbrella_angle(angle)
+
+    # -- bonds mode ----------------------------------------------------------
+
+    def _bond_prompt(self) -> str:
+        if self._bond_pending is None:
+            return "Bonds: click the first atom of the pair."
+        return f"Bonds: atom {self._bond_pending + 1} picked; click its partner."
+
+    def _on_bond_click(self, index: int) -> None:
+        """Create/delete the bond between two consecutively clicked atoms."""
+        molecule = self.renderer.molecule
+        if molecule is None:
+            return
+        index = int(index)
+        if self._bond_pending is None:
+            self._bond_pending = index
+            self.renderer.select_atom(index)
+            self._update_properties(index)
+            self.statusBar().showMessage(self._bond_prompt())
+            return
+        if self._bond_pending == index:
+            self._bond_pending = None
+            self.renderer.select_atom(None)
+            self._update_properties(None)
+            self.statusBar().showMessage(self._bond_prompt())
+            return
+        self._push_undo()
+        bonds = toggle_bond(self.renderer.bonds, self._bond_pending, index)
+        molecule.bonds = bonds
+        self._bond_pending = None
+        self.renderer.select_atom(None)
+        self._redraw_edited()
+        self._update_properties(None)
+        self.statusBar().showMessage(
+            f"Bonds: {molecule.n_atoms} atoms · {len(bonds)} bond(s)."
+        )
+
+    # -- umbrella mode -------------------------------------------------------
+
+    def _umbrella_prompt(self) -> str:
+        if self._umbrella_ref is None:
+            return "Umbrella: click the reference atom (the pivot)."
+        if self._umbrella_axis is None:
+            return "Umbrella: click the axis atom (defines the rotation axis)."
+        if not self._umbrella_interests:
+            return "Umbrella: click at least one interest atom."
+        ids = ", ".join(str(i + 1) for i in self._umbrella_interests)
+        return (
+            f"Umbrella: reference {self._umbrella_ref + 1} · "
+            f"axis {self._umbrella_axis + 1} · interests {ids} — use the "
+            "slider or drag an interest atom."
+        )
+
+    def _on_umbrella_click(self, index: int) -> None:
+        """Fill the reference/axis/interests roles from consecutive clicks."""
+        index = int(index)
+        if self._umbrella_ref is None:
+            self._umbrella_ref = index
+        elif index == self._umbrella_ref:
+            self._umbrella_ref = None
+            self._umbrella_axis = None
+            self._umbrella_interests = []
+        elif self._umbrella_axis is None:
+            self._umbrella_axis = index
+        elif index == self._umbrella_axis:
+            self._umbrella_axis = None
+            self._umbrella_interests = []
+        elif index in self._umbrella_interests:
+            self._umbrella_interests.remove(index)
+        else:
+            self._umbrella_interests.append(index)
+        self._rebuild_umbrella()
+
+    def _rebuild_umbrella(self) -> None:
+        """Recapture the umbrella snapshot from the current roles/geometry."""
+        self._umbrella = None
+        molecule = self.renderer.molecule
+        if (
+            molecule is not None
+            and self._umbrella_ref is not None
+            and self._umbrella_axis is not None
+            and self._umbrella_interests
+        ):
+            try:
+                self._umbrella = UmbrellaGroup.capture(
+                    molecule,
+                    self._umbrella_ref,
+                    self._umbrella_axis,
+                    self._umbrella_interests,
+                )
+                self._umbrella_angle = self._umbrella.theta_deg
+            except ValueError:
+                self._umbrella = None
+        self._updating_umbrella = True
+        self._umbrella_slider.setValue(int(round(self._umbrella_angle)))
+        self._updating_umbrella = False
+        self._umbrella_slider.setEnabled(self._umbrella is not None)
+        self._refresh_umbrella_movable()
+        self._refresh_umbrella_highlight()
+        self._update_umbrella_info()
+        self._refresh_edit_status()
+
+    def _refresh_umbrella_movable(self) -> None:
+        """Allow dragging only the interest atoms of the umbrella group."""
+        if self._edit_mode != "umbrella":
+            return
+        self.renderer.set_movable(list(self._umbrella_interests))
+
+    def _refresh_umbrella_highlight(self) -> None:
+        """Mark the reference/axis (pivots) and the interest atoms."""
+        if self._edit_mode != "umbrella":
+            return
+        indices: list[int] = []
+        central: list[int] = []
+        for idx in (self._umbrella_ref, self._umbrella_axis):
+            if idx is not None:
+                indices.append(int(idx))
+                central.append(int(idx))
+        indices.extend(int(i) for i in self._umbrella_interests)
+        if indices:
+            self.renderer.set_measurement(indices, central=tuple(central))
+        else:
+            self.renderer.clear_measurement()
+
+    def _update_umbrella_info(self) -> None:
+        """Refresh the angle/radius readout (the prompts go to the status bar)."""
+        if not hasattr(self, "_umbrella_angle_label"):
+            return
+        if self._umbrella is None:
+            self._umbrella_angle_label.setText("")
+            return
+        radius = float(np.mean(self._umbrella.radii))
+        self._umbrella_angle_label.setText(
+            f"angle = {self._umbrella_angle:.1f}° · r = {radius:.3f} Å"
+        )
+
+    def _on_umbrella_slider_pressed(self) -> None:
+        """Snapshot once at the start of a slider gesture (not each step)."""
+        if self._umbrella is not None:
+            self._push_undo()
+
+    def _on_umbrella_slider(self, value: int) -> None:
+        if self._updating_umbrella:
+            return
+        self._set_umbrella_angle(float(value))
+
+    def _set_umbrella_angle(self, angle: float) -> None:
+        """Apply an absolute umbrella angle and sync the slider/readout."""
+        self._umbrella_angle = float(angle)
+        self._updating_umbrella = True
+        self._umbrella_slider.setValue(int(round(self._umbrella_angle)))
+        self._updating_umbrella = False
+        molecule = self.renderer.molecule
+        if self._umbrella is not None and molecule is not None:
+            self._umbrella.apply(molecule, self._umbrella_angle)
+            self._redraw_edited()
+        self._update_umbrella_info()
+
+    # -- export --------------------------------------------------------------
+
+    def export_structure(self) -> None:
+        """Write the current geometry to an XYZ file (bonds are not stored)."""
+        molecule = self.renderer.molecule
+        if molecule is None:
+            QMessageBox.information(self, "Export", "Load a structure first.")
+            return
+        default = f"{molecule.name or 'pychem'}.xyz"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export structure", default, "XYZ files (*.xyz)"
+        )
+        if not path:
+            return
+        try:
+            write_xyz(path, molecule)
+        except Exception as exc:  # noqa: BLE001 - writer errors to the UI
+            QMessageBox.critical(self, "Error exporting", str(exc))
+            return
+        self.statusBar().showMessage(f"Structure saved: {path}")
+
     # -- trajectory playback -------------------------------------------------
 
     def _build_trajectory_controls(self) -> None:
@@ -996,7 +1591,7 @@ class MainWindow(QMainWindow):
 
         box = _CollapsibleBox("Trajectory")
         box.toggled.connect(self._on_section_toggled)
-        layout = QVBoxLayout(box)
+        layout = box.body_layout
         # Vertical gap between rows and inner margins of the group; tweak
         # ``_TRAJ_LAYOUT_SPACING`` / ``_TRAJ_LAYOUT_MARGIN`` at the top of
         # this file to your taste.
@@ -1256,7 +1851,7 @@ class MainWindow(QMainWindow):
         """
         box = _CollapsibleBox("Volumetric")
         box.toggled.connect(self._on_section_toggled)
-        outer = QVBoxLayout(box)
+        outer = box.body_layout
         outer.setSpacing(6)
         self._vol_stack = QStackedWidget(box)
         outer.addWidget(self._vol_stack)
